@@ -1,0 +1,1144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#000000" />
+<meta name="color-scheme" content="dark" />
+<title>RibbitPad — Small-Stack Token Scanner</title>
+<link rel="icon" href="logo.jpg" />
+<style>
+  /* ---------------------------------------------------------------
+     RibbitPad type scale — built for reading on a phone in one hand.
+     Nothing below 13px for content. Secondary text lifted to a
+     contrast ratio that stays legible on the dark swamp background.
+     --------------------------------------------------------------- */
+  :root{
+    --bg:#000000;--panel:#0B0B0B;--raised:#141414;--line:#2A2A2A;--line2:#3D3D3D;
+    --frog:#4EFF3B;--neon:#2BFFC0;--glass:#7FFFE8;
+    --amber:#FFCC44;--red:#FF6B7A;--blue:#6FBEFF;--purple:#C9B4FF;
+    --text:#FFFFFF;--text2:#E0E0E0;--dim:#B0B0B0;
+    --font:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,monospace;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html{background:#000 !important;min-height:100%}
+  html,body{margin:0;padding:0;background:#000 !important;color:#fff;
+    color-scheme:dark;font-family:var(--font);font-size:17px;line-height:1.55;-webkit-font-smoothing:antialiased;
+    -webkit-text-size-adjust:100%}
+  body{background:#000 !important;min-height:100vh}
+  #app{background:#000 !important;min-height:100vh;display:block}
+  .pane{background:#000 !important}
+  .card{background:#000}
+  .card.blocked{background:#160809 !important}
+  .mono{font-family:var(--mono)}
+  .up{color:var(--neon)}.down{color:var(--red)}
+
+  /* ---------- header ---------- */
+  header{position:sticky;top:0;z-index:20;background:#000;
+    border-bottom:1px solid var(--line);padding:max(14px,env(safe-area-inset-top,14px)) 18px 14px;
+    display:flex;align-items:center;justify-content:space-between;gap:12px}
+  .brand{display:flex;align-items:center;gap:13px;min-width:0}
+  .logo{width:52px;height:52px;border-radius:14px;flex-shrink:0;object-fit:cover;
+    border:2px solid rgba(110,232,90,.5);box-shadow:0 0 22px rgba(110,232,90,.28);background:var(--raised)}
+  .logofb{width:52px;height:52px;border-radius:14px;flex-shrink:0;display:none;
+    align-items:center;justify-content:center;font-size:27px;background:var(--raised);
+    border:2px solid rgba(110,232,90,.5)}
+  .brand h1{font-size:22px;margin:0;font-weight:800;letter-spacing:-.02em;line-height:1.1}
+  .brand h1 span{color:var(--frog)}
+  .brand p{font-size:13px;margin:3px 0 0;color:var(--dim);font-family:var(--mono);line-height:1.3}
+  .live{font-family:var(--mono);font-size:12px;font-weight:700;padding:6px 11px;border-radius:99px;
+    white-space:nowrap;border:1.5px solid #2F7A24;background:#0A1A07;color:var(--frog)}
+  .live.off{border-color:#6B2C33;background:#180809;color:var(--red)}
+
+  /* ---------- stake selector ---------- */
+  .stakewrap{padding:16px 18px 14px;border-bottom:1px solid var(--line);
+    background:#0B0B0B}
+  .stakelbl{font-size:13.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);
+    font-weight:700;margin-bottom:10px}
+  .stakebar{display:flex;gap:8px}
+  .stake{flex:1;padding:13px 4px;border-radius:11px;border:1.5px solid var(--line);background:var(--raised);
+    color:var(--text2);font-family:var(--mono);font-size:16px;font-weight:700;cursor:pointer;text-align:center}
+  .stake.on{border-color:var(--frog);background:#0D2109;color:var(--frog);
+    box-shadow:0 0 16px rgba(110,232,90,.2)}
+
+  /* ---------- tabs ---------- */
+  .tabs{display:flex;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:15}
+  .tabs button{flex:1;padding:16px 4px;font-size:15px;font-weight:700;background:none;border:none;
+    border-bottom:3px solid transparent;color:var(--dim);font-family:var(--font);cursor:pointer}
+  .tabs button.on{color:var(--text);border-bottom-color:var(--frog)}
+  .tabs .n{font-family:var(--mono);font-size:12px;opacity:.8;font-weight:600}
+  .pane{display:none;padding-bottom:70px;background:#000}
+  .pane.on{display:block;background:#000}
+
+  /* ---------- buttons ---------- */
+  .toolbar{padding:14px 18px;border-bottom:1px solid var(--line);display:flex;gap:10px}
+  .toolbar button{flex:1;padding:15px;border-radius:11px;border:1.5px solid var(--line);background:var(--raised);
+    color:var(--text);font-size:15px;font-weight:700;font-family:var(--font);cursor:pointer}
+  .toolbar button.primary{background:#0D2109;border-color:var(--frog);color:var(--frog)}
+  .toolbar button:active{opacity:.7}
+
+  /* ---------- chain pills ---------- */
+  .chainbar{display:flex;gap:8px;overflow-x:auto;padding:14px 18px;border-bottom:1px solid var(--line);
+    -webkit-overflow-scrolling:touch;scrollbar-width:none}
+  .chainbar::-webkit-scrollbar{display:none}
+  .cpill{flex-shrink:0;padding:10px 15px;border-radius:99px;border:1.5px solid var(--line);
+    background:var(--raised);color:var(--text2);font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap}
+  .cpill.on{border-color:var(--frog);background:#0D2109;color:var(--frog)}
+  .cpill .fee{font-family:var(--mono);font-size:12.5px;opacity:.75;margin-left:6px}
+  .cpill.pricey{border-color:rgba(255,107,122,.4)}
+  .cpill.pricey .fee{color:var(--red);opacity:1;font-weight:700}
+
+  /* ---------- cards ---------- */
+  .card{border-bottom:1px solid var(--line);padding:20px 18px}
+  .card.blocked{background:rgba(255,107,122,.035)}
+  .card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}
+  .sym{font-weight:800;font-size:23px;letter-spacing:-.02em;line-height:1.15}
+  .name{font-size:14px;color:var(--dim);margin-top:4px;line-height:1.4}
+  .chaintag{font-family:var(--mono);font-size:12.5px;font-weight:600;padding:3px 8px;border-radius:6px;
+    border:1px solid var(--line2);color:var(--text2);margin-left:9px;vertical-align:middle}
+
+  .gradebox{text-align:center;flex-shrink:0;min-width:74px}
+  .grade{font-family:var(--mono);font-size:40px;font-weight:800;line-height:1;letter-spacing:-.04em}
+  .gradelbl{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.09em;
+    margin-top:6px;font-weight:700}
+  .convbar{height:6px;border-radius:99px;background:var(--line);margin-top:9px;overflow:hidden}
+  .convbar i{display:block;height:100%;border-radius:99px;transition:width .6s cubic-bezier(.4,0,.2,1)}
+
+  .verdict{margin-top:15px;padding:14px;border-radius:11px;font-size:15px;font-weight:600;
+    display:flex;align-items:flex-start;gap:9px;line-height:1.5}
+  .verdict .vi{font-size:16px;flex-shrink:0}
+  .verdict.pass{border:1.5px solid #2F7A24;background:#0A1A07;color:var(--frog)}
+  .verdict.caution{border:1.5px solid #6B5420;background:#181206;color:var(--amber)}
+  .verdict.block{border:1.5px solid #6B2C33;background:#180809;color:var(--red)}
+
+  /* ---------- cost box ---------- */
+  .feebox{margin-top:14px;padding:14px;border-radius:11px;border:1.5px solid #4A3D75;
+    background:#100D1A}
+  .feebox .fh{font-size:13px;text-transform:uppercase;letter-spacing:.09em;color:var(--purple);
+    font-weight:800;margin-bottom:10px}
+  .feerow{display:flex;justify-content:space-between;gap:12px;font-family:var(--mono);
+    font-size:15px;padding:4px 0;color:var(--text)}
+  .feerow .fk{color:var(--text2);font-size:14.5px;font-family:var(--font)}
+  .feebig{margin-top:11px;padding-top:11px;border-top:1px solid rgba(188,164,255,.28);
+    display:flex;justify-content:space-between;font-family:var(--mono);font-size:16px;font-weight:800}
+  .feebig .fkb{font-family:var(--font);font-size:14px;color:var(--text)}
+
+  .thesis{margin-top:14px;padding:15px;border-radius:11px;border:1px solid var(--line);
+    background:var(--panel);font-size:15.5px;line-height:1.65;color:var(--text2)}
+  .thesis b{color:var(--text);font-weight:700}
+
+  /* ---------- factor + audit lists ---------- */
+  .factors,.audit,.levels{margin-top:14px;border:1px solid var(--line);border-radius:11px;overflow:hidden}
+  .factors .hd,.audit .hd,.levels .hd{padding:12px 14px;background:var(--raised);font-size:12px;
+    text-transform:uppercase;letter-spacing:.09em;color:var(--text2);font-weight:800;
+    border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:10px}
+  .fac{display:flex;align-items:center;gap:11px;padding:11px 14px;border-bottom:1px solid var(--line)}
+  .fac:last-child{border-bottom:none}
+  .fac .fl{font-size:15px;flex:1;min-width:0;color:var(--text)}
+  .fac .fw{font-family:var(--mono);font-size:12.5px;color:var(--dim);flex-shrink:0}
+  .fac .fb{width:64px;height:7px;border-radius:99px;background:var(--line);overflow:hidden;flex-shrink:0}
+  .fac .fb i{display:block;height:100%;border-radius:99px}
+  .fac .fv{font-family:var(--mono);font-size:14px;font-weight:700;width:30px;text-align:right;flex-shrink:0}
+
+  .chk{display:flex;align-items:flex-start;gap:11px;padding:12px 14px;font-size:15px;
+    border-bottom:1px solid var(--line);line-height:1.5}
+  .chk:last-child{border-bottom:none}
+  .chk .ic{flex-shrink:0;width:18px;font-size:15px;font-weight:700;text-align:center;line-height:1.4}
+  .chk .tx{flex:1;color:var(--text)}
+  .chk .vl{font-family:var(--mono);font-size:13px;color:var(--dim);flex-shrink:0;text-align:right}
+  .chk.ok .ic{color:var(--frog)}.chk.no .ic{color:var(--red)}
+  .chk.wr .ic{color:var(--amber)}.chk.un .ic{color:var(--dim)}
+  .chk.no .tx{color:#FFC2C9}.chk.wr .tx{color:#FFE0A8}
+  .chk.un .tx{color:var(--dim)}
+
+  /* ---------- stat grid ---------- */
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}
+  .cell{padding:13px 14px;border:1px solid var(--line);border-radius:11px;background:var(--panel)}
+  .cell .k{font-size:12.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--dim);font-weight:700}
+  .cell .v{font-size:17px;font-family:var(--mono);font-weight:700;margin-top:5px;word-break:break-all}
+
+  /* ---------- levels ---------- */
+  .lvl{display:flex;justify-content:space-between;gap:12px;padding:13px 14px;
+    border-bottom:1px solid var(--line);font-family:var(--mono);font-size:15.5px;font-weight:600}
+  .lvl:last-child{border-bottom:none}
+  .lvl .lbl{font-size:14.5px;color:var(--text2);font-family:var(--font);font-weight:500}
+  .lvl.sl{background:#170809}
+  .lvl.tp{background:#081505}
+  .lvl.be{background:#161105}
+
+  /* ---------- CA ---------- */
+  .ca{margin-top:14px;display:flex;align-items:center;gap:11px;padding:13px 14px;
+    border:1px solid var(--line);border-radius:11px;background:var(--panel)}
+  .ca code{font-family:var(--mono);font-size:14px;word-break:break-all;flex:1;
+    line-height:1.55;color:var(--text2)}
+  .ca button{flex-shrink:0;padding:10px 15px;border-radius:9px;border:1.5px solid var(--frog);
+    background:#0D2109;color:var(--frog);font-size:14px;cursor:pointer;font-weight:700;
+    font-family:var(--font)}
+  .links{display:flex;gap:10px;margin-top:11px}
+  .links a{flex:1;text-align:center;padding:13px 8px;border-radius:10px;border:1.5px solid var(--line2);
+    background:var(--raised);color:var(--glass);font-size:14px;text-decoration:none;font-weight:700}
+
+  /* ---------- states ---------- */
+  .empty{padding:56px 26px;text-align:center;color:var(--text2);font-size:15.5px;line-height:1.7}
+  .empty b{color:var(--frog)}
+  .spinner{width:30px;height:30px;border:3px solid var(--line);border-top-color:var(--frog);
+    border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 18px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .prog{font-family:var(--mono);font-size:13.5px;color:var(--dim);margin-top:12px}
+  .pbar{height:5px;background:var(--line);border-radius:99px;margin:18px auto 0;max-width:230px;overflow:hidden}
+  .pbar i{display:block;height:100%;background:var(--frog);transition:width .3s}
+
+  /* ---------- forms ---------- */
+  .field{padding:18px}
+  .field+.field{border-top:1px solid var(--line)}
+  .field label{display:block;font-size:12.5px;text-transform:uppercase;letter-spacing:.08em;
+    color:var(--text2);font-weight:800;margin-bottom:10px}
+  .field input{width:100%;padding:15px;border-radius:11px;border:1.5px solid var(--line2);
+    background:var(--panel);color:var(--text);font-family:var(--mono);font-size:16px}
+  .field input:focus{outline:none;border-color:var(--frog);box-shadow:0 0 0 3px rgba(110,232,90,.12)}
+  .field .hint{font-size:14.5px;color:var(--dim);margin-top:9px;line-height:1.6}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .tog{display:flex;align-items:center;justify-content:space-between;gap:14px;
+    padding:18px;border-top:1px solid var(--line)}
+  .tog .t{font-size:16px;font-weight:700}
+  .tog .s{font-size:14.5px;color:var(--dim);margin-top:5px;line-height:1.6}
+  .sw{width:56px;height:33px;border-radius:99px;background:var(--line2);position:relative;
+    flex-shrink:0;cursor:pointer;transition:background .2s}
+  .sw.on{background:rgba(110,232,90,.4)}
+  .sw i{position:absolute;top:3.5px;left:3.5px;width:26px;height:26px;border-radius:50%;
+    background:var(--dim);transition:all .2s}
+  .sw.on i{left:26.5px;background:var(--frog)}
+
+  /* ---------- banners ---------- */
+  .banner{margin:16px 18px;padding:17px;border-radius:12px;font-size:15.5px;line-height:1.65}
+  .banner.info{border:1.5px solid #2E6B5E;background:#0A1815;color:#B8EFE0}
+  .banner.warn{border:1.5px solid #6B5420;background:#181206;color:#FFDFA0}
+  .banner.err{border:1.5px solid #6B2C33;background:#180809;color:#FFC2C9;
+    white-space:pre-wrap;word-break:break-word}
+  .banner.err.code{font-family:var(--mono);font-size:13px}
+  .banner b{color:#fff;font-weight:700}
+
+  footer{padding:30px 18px 50px;text-align:center;font-size:13px;color:var(--dim);line-height:1.8}
+  footer img{width:52px;height:52px;border-radius:13px;opacity:.65;margin-bottom:14px}
+  footer b{color:var(--text2)}
+
+  @media (prefers-color-scheme: light){
+    html,body,#app,.pane,.card{background:#000 !important;color:#fff !important}
+    .empty,.thesis,.banner{color:inherit}
+  }
+  /* Quick Look / preview panes sometimes inject their own white sheet */
+  body::before{content:"";position:fixed;inset:0;background:#000;z-index:-1}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+(function(){
+"use strict";
+
+// ===========================================================================
+// RibbitPad — small-stack multi-chain token scanner
+//
+// Tuned specifically for $1-$100 positions. That constraint changes the maths
+// in two ways that most scanners get wrong for small traders:
+//
+//   1. SLIPPAGE STOPS MATTERING. $5 into a $20K pool is 0.02% impact. Filters
+//      built for $5,000 positions block pools that are perfectly fine for you,
+//      so the liquidity floors here scale with YOUR stake, not a fixed number.
+//
+//   2. NETWORK FEES START DOMINATING. A $5 trade on Ethereum costs $3-15 in
+//      gas round trip — you need a 2x just to break even. So fee drag is a
+//      first-class, blocking check, not a footnote.
+//
+// Everything still fails closed on safety: unknown == unsafe.
+// ===========================================================================
+
+var DS="https://api.dexscreener.com";
+var GP="https://api.gopluslabs.io/api/v1";
+var RC="https://api.rugcheck.xyz/v1";
+
+var GP_CHAIN={
+  ethereum:"1",bsc:"56",polygon:"137",arbitrum:"42161",optimism:"10",
+  avalanche:"43114",base:"8453",fantom:"250",cronos:"25",zksync:"324",
+  linea:"59144",scroll:"534352",mantle:"5000",opbnb:"204",blast:"81457",
+  gnosis:"100",moonbeam:"1284",moonriver:"1285",harmony:"1666600000",
+  kcc:"321",heco:"128",okc:"66",tron:"tron",sonic:"146",berachain:"80094",
+  abstract:"2741",unichain:"130",hyperliquid:"999",story:"1514"
+};
+
+// Typical ROUND-TRIP swap cost in USD (buy + sell). Rough estimates that move
+// with network congestion — treated as guidance, and always labelled as an
+// estimate in the UI rather than presented as a quote.
+var CHAIN_FEE={
+  solana:0.03, base:0.04, arbitrum:0.10, optimism:0.08, polygon:0.04,
+  bsc:0.30, avalanche:0.20, sui:0.04, ton:0.05, blast:0.08, linea:0.12,
+  zksync:0.15, scroll:0.12, mantle:0.10, sonic:0.05, berachain:0.10,
+  unichain:0.06, opbnb:0.05, cronos:0.20, fantom:0.05, gnosis:0.05,
+  tron:1.50, ethereum:9.00, hyperliquid:0.05, abstract:0.08, pulsechain:0.05
+};
+function chainFee(id){ return CHAIN_FEE[id]!==undefined?CHAIN_FEE[id]:0.50; }
+
+var CHAINS=[
+  {id:"all",n:"All"},{id:"solana",n:"Solana"},{id:"base",n:"Base"},
+  {id:"bsc",n:"BNB"},{id:"arbitrum",n:"Arbitrum"},{id:"polygon",n:"Polygon"},
+  {id:"sui",n:"Sui"},{id:"optimism",n:"Optimism"},{id:"avalanche",n:"Avalanche"},
+  {id:"blast",n:"Blast"},{id:"linea",n:"Linea"},{id:"ton",n:"TON"},
+  {id:"sonic",n:"Sonic"},{id:"ethereum",n:"Ethereum"}
+];
+
+var STAKES=[1,5,10,25,50,100];
+
+// Opened straight from the Files app? Browsers block network calls from
+// file:// origins, so the data APIs are unreachable. Detect it and say so
+// plainly rather than surfacing a confusing "API returned nothing" error.
+var IS_LOCAL_FILE = (typeof location!=="undefined") &&
+  (location.protocol==="file:" || location.protocol==="content:" || location.origin==="null");
+
+var S={
+  tab:"scan",loading:false,progress:"",pct:0,error:null,localBlocked:false,
+  passed:[],blocked:[],lastFetch:null,chain:"all",
+  lookup:null,lookupErr:null,lookupLoading:false,lastQuery:"",
+  cfg:{
+    stopPct:35, tp:[2,4,10], sizeUsd:5,
+    maxFeeDragPct:15,        // block if round-trip fees exceed this % of stake
+    maxImpactPct:3,
+    minLiqFloor:8000,        // absolute floor regardless of stake
+    liqMultiple:400,         // require liquidity >= stake * this
+    minVol:5000, maxAgeH:336, minAgeH:1,
+    maxBuyTax:5, maxSellTax:5, maxTop10:40,
+    strict:true, requireLpLock:true, hideBlocked:false, minGrade:"C"
+  }
+};
+
+// ---------- utils ----------
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){
+  return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+function num(v){var n=typeof v==="number"?v:parseFloat(v);return isFinite(n)?n:0;}
+function compact(n){n=num(n);
+  if(n>=1e9)return "$"+(n/1e9).toFixed(2)+"B";
+  if(n>=1e6)return "$"+(n/1e6).toFixed(2)+"M";
+  if(n>=1e3)return "$"+(n/1e3).toFixed(1)+"K";
+  return "$"+n.toFixed(0);}
+function px(n){n=num(n);
+  if(n===0)return "$0";
+  if(n<0.000001)return "$"+n.toExponential(2);
+  if(n<1)return "$"+n.toFixed(8).replace(/0+$/,"");
+  return "$"+n.toFixed(4);}
+function usd(n){n=num(n);
+  var d=Math.abs(n)<10?2:2;
+  return "$"+n.toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});}
+function ageH(ms){return ms?(Date.now()-ms)/3600000:null;}
+function ageLbl(h){if(h==null)return "?";
+  if(h<1)return Math.round(h*60)+"m";
+  if(h<48)return h.toFixed(0)+"h";
+  return (h/24).toFixed(0)+"d";}
+function chainName(id){for(var i=0;i<CHAINS.length;i++)if(CHAINS[i].id===id)return CHAINS[i].n;return id||"?";}
+
+function fetchJSON(url,ms){
+  ms=ms||12000;
+  return new Promise(function(res,rej){
+    var done=false;
+    var t=setTimeout(function(){if(!done){done=true;rej(new Error("timed out"));}},ms);
+    fetch(url,{headers:{"Accept":"application/json"}}).then(function(r){
+      if(!r.ok)throw new Error("HTTP "+r.status);return r.json();
+    }).then(function(j){if(!done){done=true;clearTimeout(t);res(j);}})
+      .catch(function(e){if(!done){done=true;clearTimeout(t);rej(e);}});
+  });
+}
+function tri(v){if(v==="1"||v===1)return true;if(v==="0"||v===0)return false;return null;}
+function pctOf(v){var n=num(v);return n<=1?n*100:n;}
+
+function priceImpact(sizeUsd,liqUsd){
+  var R=num(liqUsd)/2;
+  if(R<=0)return {inPct:100,roundPct:100};
+  var inPct=(sizeUsd/(R+sizeUsd))*100;
+  return {inPct:inPct,roundPct:Math.min(100,inPct*2)};
+}
+
+// ===========================================================================
+// The economics of a small trade — the core of RibbitPad.
+// Total cost = network fees (both legs) + slippage (both legs) + token taxes.
+// Break-even multiple tells you how far price must move just to get even.
+// ===========================================================================
+function tradeEconomics(pair,sec){
+  var size=S.cfg.sizeUsd;
+  var liq=num(pair.liquidity&&pair.liquidity.usd);
+  var fee=chainFee(pair.chainId);
+  var imp=priceImpact(size,liq);
+  var slipUsd=size*(imp.roundPct/100);
+  var buyTax=(sec&&typeof sec.buyTax==="number")?sec.buyTax:0;
+  var sellTax=(sec&&typeof sec.sellTax==="number")?sec.sellTax:0;
+  var taxUsd=size*((buyTax+sellTax)/100);
+
+  var totalUsd=fee+slipUsd+taxUsd;
+  var dragPct=size>0?(totalUsd/size)*100:100;
+  var breakEvenMult=size>0?(size+totalUsd)/Math.max(size-fee/2,0.01):99;
+
+  return {
+    size:size, feeUsd:fee, slipUsd:slipUsd, taxUsd:taxUsd,
+    totalUsd:totalUsd, dragPct:dragPct,
+    breakEvenPct:(breakEvenMult-1)*100,
+    impact:imp
+  };
+}
+
+// ===========================================================================
+// Audits
+// ===========================================================================
+function auditEvm(chainId,addr){
+  var gp=GP_CHAIN[chainId];
+  if(!gp)return Promise.resolve({source:"none",available:false,reason:"chain not covered by security API"});
+  return fetchJSON(GP+"/token_security/"+gp+"?contract_addresses="+encodeURIComponent(addr))
+    .then(function(d){
+      var r=d&&d.result&&(d.result[addr.toLowerCase()]||d.result[addr]);
+      if(!r)return {source:"goplus",available:false,reason:"no security record"};
+      var top10=0;
+      if(Array.isArray(r.holders))r.holders.slice(0,10).forEach(function(h){
+        if(h&&!tri(h.is_locked))top10+=pctOf(h.percent);});
+      var lp=0;
+      if(Array.isArray(r.lp_holders))r.lp_holders.forEach(function(h){
+        if(h&&(tri(h.is_locked)||/burn|dead|0x0{6,}/i.test(h.address||"")))lp+=pctOf(h.percent);});
+      return {source:"goplus",available:true,
+        honeypot:tri(r.is_honeypot),cannotSell:tri(r.cannot_sell_all),
+        buyTax:r.buy_tax==null||r.buy_tax===""?null:pctOf(r.buy_tax),
+        sellTax:r.sell_tax==null||r.sell_tax===""?null:pctOf(r.sell_tax),
+        mintable:tri(r.is_mintable),ownerChangeBalance:tri(r.owner_change_balance),
+        hiddenOwner:tri(r.hidden_owner),selfDestruct:tri(r.selfdestruct),
+        proxy:tri(r.is_proxy),pausable:tri(r.transfer_pausable),
+        blacklist:tri(r.is_blacklisted),antiWhaleMod:tri(r.slippage_modifiable),
+        tradingCooldown:tri(r.trading_cooldown),openSource:tri(r.is_open_source),
+        top10:top10,lpLockedPct:lp,holderCount:num(r.holder_count)};
+    }).catch(function(e){return {source:"goplus",available:false,reason:String(e.message||e)};});
+}
+
+function auditSolana(addr){
+  var g=fetchJSON(GP+"/solana/token_security?contract_addresses="+encodeURIComponent(addr))
+    .then(function(d){
+      var r=d&&d.result&&(d.result[addr]||d.result[addr.toLowerCase()]);
+      if(!r)return null;
+      var top10=0;
+      if(Array.isArray(r.holders))r.holders.slice(0,10).forEach(function(h){
+        if(h&&!tri(h.is_locked))top10+=pctOf(h.percent);});
+      var lp=0;
+      if(Array.isArray(r.lp_holders))r.lp_holders.forEach(function(h){
+        if(h&&(tri(h.is_locked)||/burn|1nc1nerator|^11111111/i.test(h.address||"")))lp+=pctOf(h.percent);});
+      return {mintAuth:r.mintable?tri(r.mintable.status):null,
+        freezeAuth:r.freezable?tri(r.freezable.status):null,
+        transferHook:r.transfer_hook_upgradable?tri(r.transfer_hook_upgradable.status):null,
+        metaMutable:r.metadata_mutable?tri(r.metadata_mutable.status):null,
+        balanceMutable:r.balance_mutable_authority?tri(r.balance_mutable_authority.status):null,
+        top10:top10,lpLockedPct:lp,holderCount:num(r.holder_count)};
+    }).catch(function(){return null;});
+  var rc=fetchJSON(RC+"/tokens/"+encodeURIComponent(addr)+"/report/summary",10000)
+    .then(function(d){return d?{score:num(d.score_normalised||d.score),
+      risks:Array.isArray(d.risks)?d.risks:[]}:null;}).catch(function(){return null;});
+
+  return Promise.all([g,rc]).then(function(a){
+    var G=a[0],R=a[1];
+    if(!G&&!R)return {source:"none",available:false,reason:"no record on GoPlus or RugCheck"};
+    var o={source:G&&R?"goplus+rugcheck":(G?"goplus":"rugcheck"),available:true,solana:true};
+    if(G){
+      o.mintRevoked=G.mintAuth===null?null:!G.mintAuth;
+      o.freezeRevoked=G.freezeAuth===null?null:!G.freezeAuth;
+      o.metaImmutable=G.metaMutable===null?null:!G.metaMutable;
+      o.balanceMutable=G.balanceMutable;o.transferHook=G.transferHook;
+      o.top10=G.top10;o.lpLockedPct=G.lpLockedPct;o.holderCount=G.holderCount;
+    }
+    if(R){
+      o.rugScore=R.score;
+      o.rugRisks=R.risks.map(function(r){return {name:r.name||"risk",
+        level:(r.level||"").toLowerCase(),desc:r.description||""};});
+      o.rugDanger=o.rugRisks.filter(function(r){return r.level==="danger";}).length;
+    }
+    return o;
+  });
+}
+function auditToken(c,a){return c==="solana"?auditSolana(a):auditEvm(c,a);}
+
+// ===========================================================================
+// THE GATE
+// ===========================================================================
+function gate(pair,sec,econ){
+  var checks=[],blockers=[],warns=[],C=S.cfg,strict=C.strict;
+  function add(s,l,v){checks.push({s:s,l:l,v:v||""});}
+  function crit(cond,ok,bad){
+    if(cond===true)add("ok",ok);
+    else if(cond===false){add("no",bad);blockers.push(bad);}
+    else{add("un","Couldn't verify: "+ok.toLowerCase());
+      if(strict)blockers.push("unverified: "+ok);else warns.push("unverified: "+ok);}
+  }
+
+  if(!sec||!sec.available){
+    add("un","Contract audit unavailable",sec&&sec.reason?sec.reason:"no data");
+    blockers.push("no security data");
+    return {verdict:"block",checks:checks,blockers:blockers,warns:warns};
+  }
+
+  // --- FEE DRAG: the check that matters most at $1-$10 ---
+  if(econ.dragPct>C.maxFeeDragPct){
+    add("no","Fees+slippage eat "+econ.dragPct.toFixed(1)+"% of a "+usd(C.sizeUsd)+" trade (limit "+C.maxFeeDragPct+"%)");
+    blockers.push("fee drag "+econ.dragPct.toFixed(0)+"%");
+  } else if(econ.dragPct>C.maxFeeDragPct*0.6){
+    add("wr","Fees+slippage take "+econ.dragPct.toFixed(1)+"% — need +"+econ.breakEvenPct.toFixed(1)+"% to break even");
+    warns.push("high fee drag");
+  } else {
+    add("ok","Total cost "+usd(econ.totalUsd)+" ("+econ.dragPct.toFixed(1)+"% of stake)");
+  }
+
+  if(sec.solana){
+    crit(sec.mintRevoked,"Mint authority revoked","Mint authority ACTIVE — supply can be inflated");
+    crit(sec.freezeRevoked,"Freeze authority revoked","Freeze authority ACTIVE — tokens can be frozen");
+    if(sec.balanceMutable===true){add("no","Authority can alter balances");blockers.push("balance mutable");}
+    else if(sec.balanceMutable===false)add("ok","Balances not alterable");
+    if(sec.transferHook===true){add("no","Upgradable transfer hook — sells can be blocked later");blockers.push("transfer hook");}
+    else if(sec.transferHook===false)add("ok","No upgradable transfer hook");
+    if(sec.metaImmutable===false){add("wr","Metadata still mutable");warns.push("metadata mutable");}
+    else if(sec.metaImmutable===true)add("ok","Metadata immutable");
+    if(typeof sec.rugScore==="number"){
+      var rs=sec.rugScore;
+      add(rs>=70?"ok":rs>=40?"wr":"no","RugCheck score "+rs.toFixed(0)+"/100");
+      if(rs<35)blockers.push("RugCheck "+rs.toFixed(0));else if(rs<60)warns.push("mediocre RugCheck score");
+    }
+    (sec.rugRisks||[]).forEach(function(r){
+      if(r.level==="danger"){add("no","RugCheck: "+r.name);blockers.push(r.name);}
+      else if(r.level==="warn")add("wr","RugCheck: "+r.name);
+    });
+  } else {
+    crit(sec.honeypot===null?null:!sec.honeypot,"Not flagged as a honeypot","FLAGGED AS HONEYPOT — you cannot sell");
+    crit(sec.cannotSell===null?null:!sec.cannotSell,"Sell simulation succeeded","Sell simulation FAILED — cannot exit fully");
+    if(sec.sellTax===null){add("un","Couldn't verify: sell tax","unknown");if(strict)blockers.push("sell tax unverified");}
+    else if(sec.sellTax>C.maxSellTax){add("no","Sell tax "+sec.sellTax.toFixed(1)+"% over your "+C.maxSellTax+"% limit");blockers.push("sell tax "+sec.sellTax.toFixed(1)+"%");}
+    else add("ok","Sell tax "+sec.sellTax.toFixed(1)+"%");
+    if(sec.buyTax===null){add("un","Couldn't verify: buy tax","unknown");if(strict)blockers.push("buy tax unverified");}
+    else if(sec.buyTax>C.maxBuyTax){add("no","Buy tax "+sec.buyTax.toFixed(1)+"% over your "+C.maxBuyTax+"% limit");blockers.push("buy tax "+sec.buyTax.toFixed(1)+"%");}
+    else add("ok","Buy tax "+sec.buyTax.toFixed(1)+"%");
+    crit(sec.mintable===null?null:!sec.mintable,"Not mintable","MINTABLE — supply can be inflated");
+    if(sec.ownerChangeBalance===true){add("no","Owner can change your balance");blockers.push("owner can change balances");}
+    else if(sec.ownerChangeBalance===false)add("ok","Owner cannot change balances");
+    if(sec.hiddenOwner===true){add("no","Hidden owner detected");blockers.push("hidden owner");}
+    else if(sec.hiddenOwner===false)add("ok","No hidden owner");
+    if(sec.selfDestruct===true){add("no","Contract can self-destruct");blockers.push("selfdestruct");}
+    if(sec.pausable===true){add("no","Transfers can be paused");blockers.push("transfers pausable");}
+    else if(sec.pausable===false)add("ok","Transfers cannot be paused");
+    if(sec.blacklist===true){add("no","Blacklist present — you can be blocked from selling");blockers.push("blacklist");}
+    else if(sec.blacklist===false)add("ok","No blacklist function");
+    if(sec.antiWhaleMod===true){add("wr","Tax/slippage modifiable by owner");warns.push("tax modifiable");}
+    if(sec.tradingCooldown===true){add("wr","Trading cooldown enforced");warns.push("cooldown");}
+    if(sec.proxy===true){add("wr","Proxy contract — logic upgradable");warns.push("upgradable proxy");}
+    if(sec.openSource===false){add("no","Source code NOT verified");blockers.push("unverified source");}
+    else if(sec.openSource===true)add("ok","Source code verified");
+  }
+
+  if(typeof sec.top10==="number"&&sec.top10>0){
+    if(sec.top10>C.maxTop10){add("no","Top 10 wallets hold "+sec.top10.toFixed(1)+"% (limit "+C.maxTop10+"%)");blockers.push("top10 "+sec.top10.toFixed(0)+"%");}
+    else add("ok","Top 10 wallets hold "+sec.top10.toFixed(1)+"%");
+  } else {add("un","Couldn't verify: holder distribution","unknown");if(strict)warns.push("distribution unverified");}
+
+  if(C.requireLpLock){
+    if(typeof sec.lpLockedPct==="number"&&sec.lpLockedPct>=50)add("ok","Liquidity locked/burned "+sec.lpLockedPct.toFixed(0)+"%");
+    else if(typeof sec.lpLockedPct==="number"&&sec.lpLockedPct>0){add("no","Only "+sec.lpLockedPct.toFixed(0)+"% of liquidity locked");blockers.push("LP mostly unlocked");}
+    else{add("un","Couldn't verify: liquidity lock","unknown");
+      if(strict)blockers.push("LP lock unverified");else warns.push("LP lock unverified");}
+  }
+
+  // --- market structure, with liquidity scaled to YOUR stake ---
+  var liq=num(pair.liquidity&&pair.liquidity.usd),fdv=num(pair.fdv||pair.marketCap);
+  var vol=num(pair.volume&&pair.volume.h24),age=ageH(pair.pairCreatedAt);
+  var ratio=fdv>0?liq/fdv:0;
+  var liqNeeded=Math.max(C.minLiqFloor,C.sizeUsd*C.liqMultiple);
+
+  if(liq<liqNeeded){
+    add("no","Liquidity "+compact(liq)+" under "+compact(liqNeeded)+" needed for a "+usd(C.sizeUsd)+" trade");
+    blockers.push("thin for your size");
+  } else add("ok","Liquidity "+compact(liq)+" — "+Math.round(liq/Math.max(C.sizeUsd,0.01))+"x your stake");
+
+  if(ratio>0&&ratio<0.02){add("no","Liquidity only "+(ratio*100).toFixed(1)+"% of FDV");blockers.push("liq/FDV too low");}
+  else if(ratio>=0.05)add("ok","Liquidity "+(ratio*100).toFixed(1)+"% of FDV");
+  if(age!=null&&age<C.minAgeH){add("no","Only "+ageLbl(age)+" old (min "+C.minAgeH+"h)");blockers.push("too new");}
+  else if(age!=null)add("ok","Pair age "+ageLbl(age));
+  if(vol<C.minVol){add("wr","24h volume "+compact(vol)+" below your floor");warns.push("low volume");}
+  else add("ok","24h volume "+compact(vol));
+
+  if(econ.impact.roundPct>C.maxImpactPct){
+    add("no","Slippage ~"+econ.impact.roundPct.toFixed(1)+"% round trip");
+    blockers.push("slippage "+econ.impact.roundPct.toFixed(1)+"%");
+  }
+
+  var tx=(pair.txns&&pair.txns.h24)||{},b=num(tx.buys),sl=num(tx.sells);
+  if(b+sl>50&&sl>b*1.6){add("wr","Sells outpacing buys "+sl+"/"+b);warns.push("sell pressure");}
+
+  var m5=num(pair.priceChange&&pair.priceChange.m5),h1w=num(pair.priceChange&&pair.priceChange.h1);
+  var h6w=Math.abs(num(pair.priceChange&&pair.priceChange.h6));
+  var shortW=Math.max(Math.abs(m5),Math.abs(h1w));
+  if(shortW>20&&h6w<shortW*0.35){
+    add("wr","Vertical move (+"+shortW.toFixed(0)+"% short-term, no 6h base) — likely buying the top");
+    warns.push("unsupported spike");
+  }
+
+  return {verdict:blockers.length?"block":(warns.length?"caution":"pass"),
+    checks:checks,blockers:blockers,warns:warns};
+}
+
+// ===========================================================================
+// Conviction model — reweighted for small stacks.
+// Exit cost is replaced by NET COST EFFICIENCY (fees+slippage+tax), because
+// at $5 the fee is the dominant term and pure slippage is nearly zero.
+// ===========================================================================
+var FACTORS=[
+  {k:"cost", n:"Cost efficiency (fees)", w:0.18},
+  {k:"liq",  n:"Liquidity depth vs FDV", w:0.15},
+  {k:"turn", n:"Volume turnover",        w:0.14},
+  {k:"flow", n:"Buy/sell pressure",      w:0.13},
+  {k:"trend",n:"Momentum consistency",   w:0.12},
+  {k:"room", n:"Headroom (FDV size)",    w:0.14},
+  {k:"dist", n:"Holder distribution",    w:0.09},
+  {k:"matur",n:"Maturity window",        w:0.05}
+];
+
+function conviction(p,sec,econ){
+  var C=S.cfg;
+  var liq=num(p.liquidity&&p.liquidity.usd),fdv=num(p.fdv||p.marketCap);
+  var vol=num(p.volume&&p.volume.h24);
+  var m5=num(p.priceChange&&p.priceChange.m5),h1=num(p.priceChange&&p.priceChange.h1);
+  var h6=num(p.priceChange&&p.priceChange.h6),h24=num(p.priceChange&&p.priceChange.h24);
+  var tx=(p.txns&&p.txns.h24)||{},buys=num(tx.buys),sells=num(tx.sells);
+  var age=ageH(p.pairCreatedAt);
+  var f={};
+
+  // 1. Cost efficiency — how much of your stake survives the round trip.
+  f.cost=Math.max(0,Math.min(100,100-(econ.dragPct/C.maxFeeDragPct)*100));
+
+  var ratio=fdv>0?liq/fdv:0;
+  f.liq=Math.max(0,Math.min(100,(ratio/0.12)*100));
+
+  var turn=liq>0?vol/liq:0;
+  f.turn=Math.max(0,Math.min(100,(1-Math.exp(-turn/1.8))*100));
+
+  var tot=buys+sells;
+  f.flow=tot>20?Math.max(0,Math.min(100,(buys/tot)*145-22)):35;
+
+  var tf=[m5,h1,h6,h24].filter(function(x){return x!==0;});
+  var pos=tf.filter(function(x){return x>0;}).length;
+  var align=tf.length?pos/tf.length:0.5;
+  var avg=tf.length?tf.reduce(function(a,b){return a+b;},0)/tf.length:0;
+  var shortMove=Math.max(Math.abs(m5),Math.abs(h1));
+  var unsupported=shortMove>20&&Math.abs(h6)<shortMove*0.35;
+  var spikePenalty=unsupported?Math.min(95,25+(shortMove-20)*1.1):0;
+  f.trend=Math.max(0,Math.min(100,align*60+Math.min(40,Math.max(-20,avg*0.8))-spikePenalty));
+
+  // Headroom matters more for a small stack chasing multiples.
+  f.room=fdv>0?Math.max(0,Math.min(100,100-(Math.log10(Math.max(fdv,1e4))-4)/2.6*100)):45;
+
+  var t10=(sec&&typeof sec.top10==="number"&&sec.top10>0)?sec.top10:null;
+  f.dist=t10==null?40:Math.max(0,Math.min(100,100-(t10/C.maxTop10)*100));
+
+  if(age==null)f.matur=40;
+  else if(age<2)f.matur=15;
+  else if(age<12)f.matur=55+((age-2)/10)*35;
+  else if(age<96)f.matur=90;
+  else if(age<336)f.matur=Math.max(35,90-((age-96)/240)*55);
+  else f.matur=30;
+
+  var total=0;FACTORS.forEach(function(F){total+=f[F.k]*F.w;});
+  total=Math.round(total*10)/10;
+  return {total:total,f:f,grade:gradeOf(total)};
+}
+
+function gradeOf(s){
+  if(s>=88)return "A+";if(s>=80)return "A";if(s>=73)return "B+";
+  if(s>=66)return "B";if(s>=58)return "C+";if(s>=50)return "C";
+  if(s>=40)return "D";return "F";
+}
+function gradeColor(g){
+  if(g==="A+"||g==="A")return "var(--frog)";
+  if(g==="B+"||g==="B")return "#9BE88A";
+  if(g==="C+"||g==="C")return "var(--amber)";
+  if(g==="D")return "#FF9A6B";
+  return "var(--red)";
+}
+var GRADE_ORDER=["F","D","C","C+","B","B+","A","A+"];
+function gradeAtLeast(g,min){return GRADE_ORDER.indexOf(g)>=GRADE_ORDER.indexOf(min);}
+
+function thesis(cv,econ){
+  var f=cv.f,ups=[],downs=[];
+  var pos={cost:"cheap to trade at your size",liq:"deep liquidity for its size",
+    turn:"heavy trading relative to pool size",flow:"buyers outnumbering sellers",
+    trend:"momentum lined up across timeframes",room:"small enough to still multiply",
+    dist:"supply spread across many wallets",matur:"in the age window where moves happen"};
+  var neg={cost:"fees eat a real share of a small stake",liq:"liquidity is shallow versus its valuation",
+    turn:"volume is light for the pool size",flow:"sellers outweighing buyers",
+    trend:"price action is a single unsupported spike",room:"valuation already large, limiting upside",
+    dist:"supply concentrated in few wallets",matur:"outside the typical age window"};
+  FACTORS.forEach(function(F){
+    if(f[F.k]>=72)ups.push(pos[F.k]); else if(f[F.k]<=38)downs.push(neg[F.k]);
+  });
+  var s="<b>Grade "+cv.grade+"</b> ("+cv.total.toFixed(0)+"/100). ";
+  if(ups.length)s+="For: "+ups.slice(0,3).join(", ")+". ";
+  if(downs.length)s+="Against: "+downs.slice(0,3).join(", ")+". ";
+  if(!ups.length&&!downs.length)s+="Middling across every factor. ";
+  s+="On "+usd(econ.size)+" you'd pay about "+usd(econ.totalUsd)+" total, so price must rise ~"+
+     econ.breakEvenPct.toFixed(1)+"% before you're even.";
+  return s;
+}
+
+function levels(price,econ){
+  price=num(price);
+  var be=price*(1+econ.breakEvenPct/100);
+  return {entry:price,breakEven:be,sl:price*(1-S.cfg.stopPct/100),
+    tps:S.cfg.tp.map(function(m){return {m:m,price:price*m};}),
+    risk:S.cfg.sizeUsd*(S.cfg.stopPct/100)};
+}
+
+// ===========================================================================
+// Pipeline
+// ===========================================================================
+function preScreen(p){
+  if(S.chain!=="all"&&p.chainId!==S.chain)return false;
+  var liq=num(p.liquidity&&p.liquidity.usd),vol=num(p.volume&&p.volume.h24),age=ageH(p.pairCreatedAt);
+  var need=Math.max(S.cfg.minLiqFloor,S.cfg.sizeUsd*S.cfg.liqMultiple);
+  if(liq<need*0.7)return false;
+  if(vol<S.cfg.minVol*0.5)return false;
+  if(age!=null&&(age>S.cfg.maxAgeH||age<S.cfg.minAgeH*0.5))return false;
+  return true;
+}
+
+function runScan(){
+  if(IS_LOCAL_FILE){ S.localBlocked=true; S.error=null; render(); return; }
+  S.loading=true;S.error=null;S.localBlocked=false;S.passed=[];S.blocked=[];S.pct=0;
+  S.progress="Hopping across chains…";render();
+
+  // Three sources. If the boost feeds are empty (they can be, briefly),
+  // fall back to a broad search so the scan still returns something.
+  Promise.all([
+    fetchJSON(DS+"/token-boosts/latest/v1").catch(function(){return [];}),
+    fetchJSON(DS+"/token-boosts/top/v1").catch(function(){return [];})
+  ]).then(function(res){
+    var seen={},byChain={};
+    res.forEach(function(arr){
+      (Array.isArray(arr)?arr:[]).forEach(function(b){
+        if(!b||!b.tokenAddress)return;
+        var k=(b.chainId||"")+":"+b.tokenAddress;
+        if(seen[k])return;seen[k]=1;
+        (byChain[b.chainId||"unknown"]=byChain[b.chainId||"unknown"]||[]).push(b.tokenAddress);
+      });
+    });
+    var chains=Object.keys(byChain);
+    if(!chains.length){
+      // Boost feeds were empty — fall back to trending search results.
+      return fetchJSON(DS+"/latest/dex/search?q=SOL").then(function(d){
+        var ps=(d&&d.pairs)||[];
+        if(!ps.length) throw new Error("Market API returned no tokens. It may be briefly down or rate-limiting — try again in a minute.");
+        return [{pairs:ps}];
+      });
+    }
+    var lookups=[];
+    chains.forEach(function(c){
+      var a=byChain[c];
+      for(var i=0;i<a.length;i+=30)
+        lookups.push(fetchJSON(DS+"/latest/dex/tokens/"+a.slice(i,i+30).join(","))
+          .catch(function(){return {pairs:[]};}));
+    });
+    return Promise.all(lookups);
+  }).then(function(results){
+    var best={};
+    results.forEach(function(d){
+      ((d&&d.pairs)||[]).forEach(function(p){
+        var k=(p.chainId||"")+":"+((p.baseToken&&p.baseToken.address)||"");
+        var l=num(p.liquidity&&p.liquidity.usd);
+        if(!best[k]||l>num(best[k].liquidity&&best[k].liquidity.usd))best[k]=p;
+      });
+    });
+    var list=Object.keys(best).map(function(k){return best[k];}).filter(preScreen);
+    list.sort(function(a,b){return num(b.liquidity&&b.liquidity.usd)-num(a.liquidity&&a.liquidity.usd);});
+    list=list.slice(0,40);
+    if(!list.length){S.loading=false;S.progress="";render();return;}
+
+    var i=0,done=0;
+    function next(){
+      if(i>=list.length){
+        S.passed.sort(function(a,b){return b._cv.total-a._cv.total;});
+        S.loading=false;S.progress="";S.pct=100;S.lastFetch=Date.now();render();return;
+      }
+      var p=list[i++];done++;
+      S.pct=Math.round((done/list.length)*100);
+      S.progress="Checking "+done+" of "+list.length+" · "+chainName(p.chainId);render();
+      auditToken(p.chainId,(p.baseToken&&p.baseToken.address)||"").then(function(sec){
+        p._sec=sec;
+        p._econ=tradeEconomics(p,sec);
+        p._gate=gate(p,sec,p._econ);
+        if(p._gate.verdict==="block")S.blocked.push(p);
+        else{p._cv=conviction(p,sec,p._econ);S.passed.push(p);}
+        setTimeout(next,240);
+      }).catch(function(){
+        p._sec={available:false,reason:"audit request failed"};
+        p._econ=tradeEconomics(p,null);
+        p._gate=gate(p,p._sec,p._econ);S.blocked.push(p);
+        setTimeout(next,240);
+      });
+    }
+    next();
+  }).catch(function(e){
+    S.loading=false;S.progress="";S.error=(e&&e.message)||String(e);render();
+  });
+}
+
+function lookupOne(q){
+  q=(q||"").trim();
+  if(IS_LOCAL_FILE){ S.localBlocked=true; render(); return; }
+  if(!q){S.lookupErr="Paste a contract address first.";render();return;}
+  S.lookupLoading=true;S.lookupErr=null;S.lookup=null;render();
+  fetchJSON(DS+"/latest/dex/tokens/"+encodeURIComponent(q))
+    .then(function(d){
+      var pairs=(d&&d.pairs)||[];
+      if(!pairs.length)throw new Error("No trading pair found. Check it's the token contract, not a wallet or pool.");
+      pairs.sort(function(a,b){return num(b.liquidity&&b.liquidity.usd)-num(a.liquidity&&a.liquidity.usd);});
+      var p=pairs[0];
+      return auditToken(p.chainId,(p.baseToken&&p.baseToken.address)||q).then(function(sec){
+        p._sec=sec;p._econ=tradeEconomics(p,sec);
+        p._gate=gate(p,sec,p._econ);p._cv=conviction(p,sec,p._econ);
+        S.lookup=p;S.lookupLoading=false;render();
+      });
+    }).catch(function(e){
+      S.lookupLoading=false;S.lookupErr=(e&&e.message)||String(e);render();
+    });
+}
+
+function copyCA(a,btn){
+  function ok(){btn.textContent="Copied";setTimeout(function(){btn.textContent="Copy";},1400);}
+  if(navigator.clipboard&&navigator.clipboard.writeText)
+    navigator.clipboard.writeText(a).then(ok).catch(fb);else fb();
+  function fb(){var t=document.createElement("textarea");t.value=a;t.style.position="fixed";
+    t.style.opacity="0";document.body.appendChild(t);t.select();
+    try{document.execCommand("copy");ok();}catch(e){}document.body.removeChild(t);}
+}
+
+// ===========================================================================
+// Views
+// ===========================================================================
+function cardHTML(p,isBlocked){
+  var g=p._gate,sec=p._sec||{},cv=p._cv,econ=p._econ;
+  var addr=(p.baseToken&&p.baseToken.address)||"";
+  var sym=(p.baseToken&&p.baseToken.symbol)||"?";
+  var nm=(p.baseToken&&p.baseToken.name)||"";
+  var price=num(p.priceUsd);
+
+  var h='<div class="card'+(isBlocked?" blocked":"")+'">';
+  h+='<div class="card-top"><div style="min-width:0;flex:1">'+
+     '<div class="sym">'+esc(sym)+'<span class="chaintag">'+esc(chainName(p.chainId))+'</span></div>'+
+     '<div class="name">'+esc(nm)+'</div></div>';
+  if(cv&&!isBlocked){
+    var col=gradeColor(cv.grade);
+    h+='<div class="gradebox"><div class="grade" style="color:'+col+'">'+cv.grade+'</div>'+
+       '<div class="gradelbl">conviction</div>'+
+       '<div class="convbar"><i style="width:'+cv.total+'%;background:'+col+'"></i></div></div>';
+  }
+  h+='</div>';
+
+  if(g.verdict==="block")
+    h+='<div class="verdict block"><span class="vi">⛔</span><span><b>BLOCKED</b> — '+esc(g.blockers.slice(0,3).join(" · "))+
+       (g.blockers.length>3?' · +'+(g.blockers.length-3)+' more':'')+'</span></div>';
+  else if(g.verdict==="caution")
+    h+='<div class="verdict caution"><span class="vi">⚠️</span><span><b>PASSED WITH WARNINGS</b> — '+esc(g.warns.slice(0,3).join(" · "))+'</span></div>';
+  else
+    h+='<div class="verdict pass"><span class="vi">✅</span><span><b>PASSED ALL SAFETY CHECKS</b></span></div>';
+
+  if(econ){
+    h+='<div class="feebox"><div class="fh">What a '+usd(econ.size)+' trade actually costs</div>'+
+      '<div class="feerow"><span class="fk">Network fees (both legs)</span><span>'+usd(econ.feeUsd)+'</span></div>'+
+      '<div class="feerow"><span class="fk">Slippage</span><span>'+usd(econ.slipUsd)+'</span></div>'+
+      (econ.taxUsd>0?'<div class="feerow"><span class="fk">Token taxes</span><span>'+usd(econ.taxUsd)+'</span></div>':'')+
+      '<div class="feebig"><span class="fkb">Break even at</span><span style="color:var(--amber)">+'+econ.breakEvenPct.toFixed(1)+'%</span></div></div>';
+  }
+
+  if(cv&&!isBlocked){
+    h+='<div class="thesis">'+thesis(cv,econ)+'</div>';
+    h+='<div class="factors"><div class="hd"><span>Conviction factors</span><span>'+cv.total.toFixed(0)+'/100</span></div>';
+    FACTORS.forEach(function(F){
+      var v=cv.f[F.k];
+      var c=v>=70?"var(--frog)":v>=45?"var(--amber)":"var(--red)";
+      h+='<div class="fac"><span class="fl">'+esc(F.n)+'</span><span class="fw">'+Math.round(F.w*100)+'%</span>'+
+         '<span class="fb"><i style="width:'+v.toFixed(0)+'%;background:'+c+'"></i></span>'+
+         '<span class="fv" style="color:'+c+'">'+v.toFixed(0)+'</span></div>';
+    });
+    h+='</div>';
+  }
+
+  h+='<div class="audit"><div class="hd"><span>Contract audit</span><span>'+esc(sec.source||"—")+'</span></div>';
+  g.checks.forEach(function(c){
+    var ic=c.s==="ok"?"✓":c.s==="no"?"✕":c.s==="wr"?"!":"?";
+    h+='<div class="chk '+c.s+'"><span class="ic">'+ic+'</span><span class="tx">'+esc(c.l)+'</span>'+
+       (c.v?'<span class="vl">'+esc(c.v)+'</span>':'')+'</div>';
+  });
+  h+='</div>';
+
+  if(!isBlocked){
+    var ch24=num(p.priceChange&&p.priceChange.h24);
+    h+='<div class="grid">'+
+      '<div class="cell"><div class="k">Price</div><div class="v">'+px(price)+'</div></div>'+
+      '<div class="cell"><div class="k">24h</div><div class="v '+(ch24>=0?"up":"down")+'">'+(ch24>=0?"+":"")+ch24.toFixed(1)+'%</div></div>'+
+      '<div class="cell"><div class="k">Liquidity</div><div class="v">'+compact(num(p.liquidity&&p.liquidity.usd))+'</div></div>'+
+      '<div class="cell"><div class="k">FDV</div><div class="v">'+compact(num(p.fdv||p.marketCap))+'</div></div>'+
+      '</div>';
+
+    var L=levels(price,econ);
+    h+='<div class="levels"><div class="hd">Your plan — '+usd(S.cfg.sizeUsd)+' in</div>'+
+      '<div class="lvl"><span class="lbl">Entry (now)</span><span>'+px(L.entry)+'</span></div>'+
+      '<div class="lvl be"><span class="lbl">Break even (after costs)</span>'+
+      '<span style="color:var(--amber)">'+px(L.breakEven)+'</span></div>'+
+      '<div class="lvl sl"><span class="lbl">Stop loss −'+S.cfg.stopPct+'%</span>'+
+      '<span class="down">'+px(L.sl)+' · −'+usd(L.risk)+'</span></div>';
+    L.tps.forEach(function(t){
+      var net=S.cfg.sizeUsd*(t.m-1)-econ.totalUsd;
+      h+='<div class="lvl tp"><span class="lbl">Take profit '+t.m+'x</span>'+
+        '<span class="up">'+px(t.price)+' · +'+usd(net)+' net</span></div>';
+    });
+    h+='</div>';
+  }
+
+  h+='<div class="ca"><code>'+esc(addr)+'</code><button data-copy="'+esc(addr)+'">Copy</button></div>';
+  var links='';
+  if(p.url)links+='<a href="'+esc(p.url)+'" target="_blank" rel="noopener">Chart ↗</a>';
+  if(p.chainId==="solana")links+='<a href="https://rugcheck.xyz/tokens/'+esc(addr)+'" target="_blank" rel="noopener">RugCheck ↗</a>';
+  else if(GP_CHAIN[p.chainId])links+='<a href="https://gopluslabs.io/token-security/'+esc(GP_CHAIN[p.chainId])+'/'+esc(addr)+'" target="_blank" rel="noopener">GoPlus ↗</a>';
+  if(links)h+='<div class="links">'+links+'</div>';
+  return h+'</div>';
+}
+
+function stakeBar(){
+  var h='<div class="stakewrap"><div class="stakelbl">How much are you putting in?</div><div class="stakebar">';
+  STAKES.forEach(function(v){
+    h+='<div class="stake'+(S.cfg.sizeUsd===v?" on":"")+'" data-stake="'+v+'">$'+v+'</div>';
+  });
+  return h+'</div></div>';
+}
+
+function chainBar(){
+  var h='<div class="chainbar">';
+  CHAINS.forEach(function(c){
+    var fee=c.id==="all"?null:chainFee(c.id);
+    var pricey=fee!==null&&fee>S.cfg.sizeUsd*0.10;
+    h+='<div class="cpill'+(S.chain===c.id?" on":"")+(pricey?" pricey":"")+'" data-chain="'+c.id+'">'+
+       esc(c.n)+(fee!==null?'<span class="fee">'+(fee<1?"$"+fee.toFixed(2):"$"+fee.toFixed(0))+'</span>':'')+'</div>';
+  });
+  return h+'</div>';
+}
+
+function localFileNotice(){
+  return '<div class="banner warn">'+
+    '<b>RibbitPad needs to be online to scan.</b><br><br>'+
+    'You opened this straight from the Files app, so your browser is blocking it from '+
+    'reaching the market and security APIs. That is a browser security rule, not a bug '+
+    'in the app \u2014 local files are never allowed to call outside websites.'+
+    '</div>'+
+    '<div class="banner info"><b>To fix it, put it online (free, 3 minutes):</b><br><br>'+
+    '1. Go to <b>github.com</b> and open your repository<br>'+
+    '2. Tap <b>Add file \u2192 Upload files</b><br>'+
+    '3. Upload <b>index.html</b> and <b>logo.jpg</b> together<br>'+
+    '4. Tap <b>Commit changes</b><br>'+
+    '5. Wait about a minute, then open your Pages link<br><br>'+
+    'Everything works from that link \u2014 scanning, audits, grades.</div>'+
+    '<div class="empty">Until then you can still explore the layout and settings tabs.</div>';
+}
+
+function scanPane(){
+  var h='<div class="toolbar"><button class="primary" id="refresh">'+
+        (S.loading?"Scanning…":"🐸 Scan all chains")+'</button></div>'+chainBar();
+
+  var fee=S.chain!=="all"?chainFee(S.chain):null;
+  if(fee!==null&&fee>S.cfg.sizeUsd*0.15){
+    h+='<div class="banner err" >⚠️ <b>'+esc(chainName(S.chain))+
+       ' costs about '+usd(fee)+' round trip.</b> On a '+usd(S.cfg.sizeUsd)+' trade that is '+
+       ((fee/S.cfg.sizeUsd)*100).toFixed(0)+'% of your stake gone before price moves. Solana and Base cost a few cents — use those for small stakes.</div>';
+  }
+
+  h+='<div class="banner info">Tuned for small stacks. Liquidity requirements scale to <b>your</b> stake instead of a fixed floor, and network fees are a blocking check — because at '+usd(S.cfg.sizeUsd)+' the gas bill matters more than slippage.</div>';
+
+  if(S.localBlocked)return h+localFileNotice();
+  if(S.error)return h+'<div class="banner err code">Scan failed:\n\n'+esc(S.error)+'\n\nTap to retry. Free APIs rate-limit — wait a minute if it repeats.</div>';
+  if(S.loading)return h+'<div class="empty"><div class="spinner"></div>'+esc(S.progress||"Working…")+
+    '<div class="pbar"><i style="width:'+S.pct+'%"></i></div>'+
+    '<div class="prog">Audited one at a time to stay under rate limits.</div></div>';
+  if(!S.passed.length&&!S.blocked.length)
+    return h+'<div class="empty">Pick your stake above, choose a chain, and tap <b>Scan all chains</b>.</div>';
+
+  var shown=S.passed.filter(function(p){return gradeAtLeast(p._cv.grade,S.cfg.minGrade);});
+  var hidden=S.passed.length-shown.length;
+
+  if(shown.length){
+    h+='<div class="banner warn"><b>'+shown.length+' graded '+S.cfg.minGrade+'+</b> of '+
+      (S.passed.length+S.blocked.length)+' checked'+(hidden?', '+hidden+' lower hidden':'')+
+      '. A grade measures <b>survivability and room to move</b> — not odds of going up.</div>';
+    shown.forEach(function(p){h+=cardHTML(p,false);});
+  } else if(S.passed.length){
+    h+='<div class="banner warn"><b>'+S.passed.length+' passed safety</b> but none hit grade '+S.cfg.minGrade+
+      '. Lower the minimum in Settings to see them.</div>';
+  } else {
+    h+='<div class="banner warn"><b>Nothing passed.</b> All '+S.blocked.length+
+      ' failed a check. Normal result — most tokens fail.</div>';
+  }
+
+  if(S.blocked.length&&!S.cfg.hideBlocked){
+    h+='<div class="banner err" >⛔ '+S.blocked.length+
+      ' blocked below, each with the reason it was caught.</div>';
+    S.blocked.forEach(function(p){h+=cardHTML(p,true);});
+  }
+
+  h+='<footer><img src="logo.jpg" alt="" onerror="this.style.display=\'none\'"><br>'+
+    'RibbitPad · Market: DexScreener · Security: GoPlus, RugCheck<br>Last scan '+
+    (S.lastFetch?new Date(S.lastFetch).toLocaleTimeString():"—")+'<br><br>'+
+    'Fee figures are estimates and move with congestion. Grades rank measurable qualities, not future price. Nothing here is financial advice.</footer>';
+  return h;
+}
+
+function lookupPane(){
+  var h='<div class="field"><label>Contract address</label>'+
+    '<input id="caInput" placeholder="Paste any token CA…" autocapitalize="off" autocorrect="off" '+
+    'spellcheck="false" value="'+esc(S.lastQuery)+'" />'+
+    '<div class="hint">Full audit, grade, and true cost breakdown for your '+usd(S.cfg.sizeUsd)+' stake. Any chain.</div></div>'+
+    '<div class="toolbar"><button class="primary" id="doLookup">🐸 Audit &amp; grade</button></div>';
+  if(S.localBlocked)return h+localFileNotice();
+  if(S.lookupLoading)return h+'<div class="empty"><div class="spinner"></div>Checking contract…</div>';
+  if(S.lookupErr)return h+'<div class="banner err">'+esc(S.lookupErr)+'</div>';
+  if(S.lookup)return h+cardHTML(S.lookup,S.lookup._gate.verdict==="block");
+  return h+'<div class="empty">Paste a contract address before you buy — honeypot audit, grade, real cost, and your exact levels.</div>';
+}
+
+function cfgPane(){
+  var c=S.cfg;
+  function sw(id,on){return '<div class="sw'+(on?" on":"")+'" id="'+id+'"><i></i></div>';}
+  var gh='<div class="chainbar" style="border-bottom:none;padding:0 0 4px">';
+  ["F","D","C","C+","B","B+","A","A+"].forEach(function(g){
+    gh+='<div class="cpill'+(c.minGrade===g?" on":"")+'" data-grade="'+g+'">'+g+'</div>';});
+  gh+='</div>';
+
+  var need=Math.max(c.minLiqFloor,c.sizeUsd*c.liqMultiple);
+
+  return ''+
+  '<div class="banner info">Your stake is <b>'+usd(c.sizeUsd)+'</b>. At that size a token needs about <b>'+
+  compact(need)+'</b> of liquidity, and anything costing more than <b>'+usd(c.sizeUsd*c.maxFeeDragPct/100)+
+  '</b> in total fees gets blocked.</div>'+
+
+  '<div class="tog"><div><div class="t">Strict mode</div><div class="s">Block anything unverifiable, not just what fails outright. Unverifiable usually means brand new or deliberately obscured.</div></div>'+sw("swStrict",c.strict)+'</div>'+
+  '<div class="tog"><div><div class="t">Require locked liquidity</div><div class="s">Block tokens without 50%+ of LP locked or burned. Unlocked LP is how most rugs happen.</div></div>'+sw("swLp",c.requireLpLock)+'</div>'+
+  '<div class="tog"><div><div class="t">Hide blocked tokens</div><div class="s">Off by default — seeing what got caught shows the filter working.</div></div>'+sw("swHide",c.hideBlocked)+'</div>'+
+
+  '<div class="field"><label>Minimum grade to show</label>'+gh+'</div>'+
+
+  '<div class="field"><label>Max total cost (% of stake)</label><input id="cDrag" type="number" inputmode="decimal" value="'+c.maxFeeDragPct+'" />'+
+  '<div class="hint">Blocks trades where fees + slippage + taxes exceed this share. At '+usd(c.sizeUsd)+' that caps total cost at '+usd(c.sizeUsd*c.maxFeeDragPct/100)+'. This is the single most important setting for small trades.</div></div>'+
+
+  '<div class="field"><label>Liquidity needed per $1 of stake</label><input id="cLiqM" type="number" inputmode="decimal" value="'+c.liqMultiple+'" />'+
+  '<div class="hint">Requires liquidity of at least stake × this. At '+usd(c.sizeUsd)+' × '+c.liqMultiple+' = '+compact(c.sizeUsd*c.liqMultiple)+' (floor '+compact(c.minLiqFloor)+').</div></div>'+
+
+  '<div class="field"><label>Absolute liquidity floor</label><input id="cLiqF" type="number" inputmode="decimal" value="'+c.minLiqFloor+'" />'+
+  '<div class="hint">Never go below this no matter how small the stake — very thin pools are manipulable regardless of your size.</div></div>'+
+
+  '<div class="field"><label>Stop loss %</label><input id="cStop" type="number" inputmode="decimal" value="'+c.stopPct+'" />'+
+  '<div class="hint">At '+c.stopPct+'% you risk '+usd(c.sizeUsd*c.stopPct/100)+'. Wider stops suit small stacks — a tight stop on a volatile microcap just pays fees twice.</div></div>'+
+
+  '<div class="field"><label>Take-profit multiples</label><input id="cTp" value="'+c.tp.join(", ")+'" />'+
+  '<div class="hint">Comma-separated, e.g. "2, 4, 10".</div></div>'+
+
+  '<div class="field"><label>Max buy / sell tax %</label><div class="row2">'+
+  '<input id="cBuyTax" type="number" inputmode="decimal" value="'+c.maxBuyTax+'" />'+
+  '<input id="cSellTax" type="number" inputmode="decimal" value="'+c.maxSellTax+'" /></div></div>'+
+
+  '<div class="field"><label>Max top-10 holder %</label><input id="cTop10" type="number" inputmode="decimal" value="'+c.maxTop10+'" /></div>'+
+
+  '<div class="field"><label>Min 24h volume</label><input id="cVol" type="number" inputmode="decimal" value="'+c.minVol+'" /></div>'+
+
+  '<div class="field"><label>Min / max pair age (hours)</label><div class="row2">'+
+  '<input id="cMinAge" type="number" inputmode="decimal" value="'+c.minAgeH+'" />'+
+  '<input id="cMaxAge" type="number" inputmode="decimal" value="'+c.maxAgeH+'" /></div></div>'+
+
+  '<div class="toolbar"><button class="primary" id="saveCfg">Save settings</button></div>'+
+
+  '<div class="banner warn"><b>The honest maths of small trades.</b> On a '+usd(c.sizeUsd)+' stake, a 2x nets you about '+
+  usd(c.sizeUsd)+' before costs. Solana or Base leave nearly all of that; Ethereum would take most of it. Trading small is a fine way to learn with money you can lose — just don\u2019t expect it to compound into much, and never let the size tempt you into skipping the audit.</div>';
+}
+
+function render(){
+  var app=document.getElementById("app");
+  var shown=S.passed.filter(function(p){return gradeAtLeast(p._cv.grade,S.cfg.minGrade);}).length;
+  app.innerHTML=
+    '<header><div class="brand">'+
+    '<img class="logo" src="logo.jpg" alt="RibbitPad" onerror="this.style.display=\'none\';document.getElementById(\'lfb\').style.display=\'flex\'" />'+
+    '<div class="logofb" id="lfb">🐸</div>'+
+    '<div><h1>Ribbit<span>Pad</span></h1><p>small-stack token scanner</p></div></div>'+
+    '<div class="live'+(S.error?" off":"")+'">'+(S.error?"ERROR":"LIVE")+'</div></header>'+
+    stakeBar()+
+    '<div class="tabs">'+
+    '<button data-tab="scan" class="'+(S.tab==="scan"?"on":"")+'">Scan'+(shown?' <span class="n">'+shown+'</span>':'')+'</button>'+
+    '<button data-tab="lookup" class="'+(S.tab==="lookup"?"on":"")+'">Check CA</button>'+
+    '<button data-tab="cfg" class="'+(S.tab==="cfg"?"on":"")+'">Settings</button>'+
+    '</div>'+
+    '<div class="pane '+(S.tab==="scan"?"on":"")+'">'+(S.tab==="scan"?scanPane():"")+'</div>'+
+    '<div class="pane '+(S.tab==="lookup"?"on":"")+'">'+(S.tab==="lookup"?lookupPane():"")+'</div>'+
+    '<div class="pane '+(S.tab==="cfg"?"on":"")+'">'+(S.tab==="cfg"?cfgPane():"")+'</div>';
+
+  Array.prototype.forEach.call(app.querySelectorAll(".tabs button"),function(b){
+    b.onclick=function(){S.tab=b.getAttribute("data-tab");render();};});
+  Array.prototype.forEach.call(app.querySelectorAll("[data-chain]"),function(b){
+    b.onclick=function(){S.chain=b.getAttribute("data-chain");render();};});
+  Array.prototype.forEach.call(app.querySelectorAll("[data-grade]"),function(b){
+    b.onclick=function(){S.cfg.minGrade=b.getAttribute("data-grade");render();};});
+  Array.prototype.forEach.call(app.querySelectorAll("[data-copy]"),function(b){
+    b.onclick=function(){copyCA(b.getAttribute("data-copy"),b);};});
+  Array.prototype.forEach.call(app.querySelectorAll("[data-stake]"),function(b){
+    b.onclick=function(){
+      S.cfg.sizeUsd=parseFloat(b.getAttribute("data-stake"));
+      // recompute economics for everything already scanned
+      S.passed.concat(S.blocked).forEach(function(p){
+        p._econ=tradeEconomics(p,p._sec);
+        p._gate=gate(p,p._sec,p._econ);
+        if(p._gate.verdict!=="block")p._cv=conviction(p,p._sec,p._econ);
+      });
+      var all=S.passed.concat(S.blocked);
+      S.passed=all.filter(function(p){return p._gate.verdict!=="block";});
+      S.blocked=all.filter(function(p){return p._gate.verdict==="block";});
+      S.passed.forEach(function(p){if(!p._cv)p._cv=conviction(p,p._sec,p._econ);});
+      S.passed.sort(function(a,b){return b._cv.total-a._cv.total;});
+      render();
+    };});
+
+  var r=document.getElementById("refresh");if(r)r.onclick=runScan;
+  var dl=document.getElementById("doLookup");
+  if(dl)dl.onclick=function(){var e=document.getElementById("caInput");
+    S.lastQuery=e?e.value:"";lookupOne(S.lastQuery);};
+  var ci=document.getElementById("caInput");
+  if(ci)ci.onkeydown=function(e){if(e.key==="Enter"){S.lastQuery=ci.value;lookupOne(ci.value);}};
+
+  function bind(id,k){var el=document.getElementById(id);
+    if(el)el.onclick=function(){S.cfg[k]=!S.cfg[k];render();};}
+  bind("swStrict","strict");bind("swLp","requireLpLock");bind("swHide","hideBlocked");
+
+  var sv=document.getElementById("saveCfg");
+  if(sv)sv.onclick=function(){
+    function gv(id,d,min){var e=document.getElementById(id);var v=e?parseFloat(e.value):NaN;
+      return isFinite(v)&&v>=(min===undefined?0:min)?v:d;}
+    var c=S.cfg;
+    c.maxFeeDragPct=gv("cDrag",c.maxFeeDragPct,0.5);
+    c.liqMultiple=gv("cLiqM",c.liqMultiple,1);
+    c.minLiqFloor=gv("cLiqF",c.minLiqFloor,0);
+    c.stopPct=Math.min(95,gv("cStop",c.stopPct,1));
+    c.maxBuyTax=gv("cBuyTax",c.maxBuyTax);c.maxSellTax=gv("cSellTax",c.maxSellTax);
+    c.maxTop10=gv("cTop10",c.maxTop10,1);c.minVol=gv("cVol",c.minVol);
+    c.minAgeH=gv("cMinAge",c.minAgeH);c.maxAgeH=gv("cMaxAge",c.maxAgeH,1);
+    var t=document.getElementById("cTp");
+    if(t){var pr=t.value.split(",").map(function(x){return parseFloat(x.trim());})
+      .filter(function(x){return isFinite(x)&&x>1;});if(pr.length)c.tp=pr;}
+    S.tab="scan";render();
+  };
+}
+
+window.onerror=function(m,s,l,c,err){
+  var a=document.getElementById("app");
+  if(a)a.innerHTML='<div class="banner err code">Startup error:\n\n'+esc((err&&err.stack)||m)+'</div>';
+};
+
+render();
+})();
+</script>
+</body>
+</html>
