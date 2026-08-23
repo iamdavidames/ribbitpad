@@ -318,6 +318,22 @@ function cacheSet(chain,addr,val){
   }
 }
 function saveCfg(){ if(LS_OK){try{localStorage.setItem("rp:cfg",JSON.stringify(S.cfg));}catch(e){}} }
+function saveWatch(){ if(LS_OK){try{
+  localStorage.setItem("rp:watch",JSON.stringify(S.watch));
+  localStorage.setItem("rp:wallets",JSON.stringify(S.wallets));
+}catch(e){}} }
+function saveTrades(){ if(LS_OK){try{localStorage.setItem("rp:trades",JSON.stringify(S.trades));}catch(e){}} }
+function loadTrades(){
+  if(!LS_OK)return;
+  try{var t=localStorage.getItem("rp:trades"); if(t) S.trades=JSON.parse(t)||[];}catch(e){}
+}
+function loadWatch(){
+  if(!LS_OK)return;
+  try{
+    var w=localStorage.getItem("rp:watch"); if(w) S.watch=JSON.parse(w)||[];
+    var v=localStorage.getItem("rp:wallets"); if(v) S.wallets=JSON.parse(v)||[];
+  }catch(e){}
+}
 function loadCfg(){
   if(!LS_OK)return null;
   try{var r=localStorage.getItem("rp:cfg");return r?JSON.parse(r):null;}catch(e){return null;}
@@ -339,12 +355,17 @@ var S={
     minVol:5000, maxAgeH:336, minAgeH:1,
     maxBuyTax:5, maxSellTax:5, maxTop10:40,
     strict:true, requireLpLock:true, hideBlocked:false, minGrade:"C",
-    auditLimit:100         // how many candidates to deep-audit per scan
+    auditLimit:100,        // how many candidates to deep-audit per scan
+    freshMaxAgeH:48, freshMinAgeH:0.5, freshMinLiq:5000
   },
-  coverage:null            // {found, chains, screened, audited} for transparency
+  coverage:null,           // {found, chains, screened, audited} for transparency
+  fresh:[], freshBlocked:[], freshLoading:false, freshErr:null, freshCoverage:null,
+  watch:[], watchData:{}, watchLoading:false, watchErr:null, watchInput:"",
+  wallets:[], walletInput:"",
+  trades:[], tradesLoading:false, journalNote:null
 };
 
-(function(){ var saved=loadCfg(); if(saved){ for(var k in saved) if(S.cfg.hasOwnProperty(k)) S.cfg[k]=saved[k]; } })();
+(function(){ var saved=loadCfg(); if(saved){ for(var k in saved) if(S.cfg.hasOwnProperty(k)) S.cfg[k]=saved[k]; } loadWatch(); loadTrades(); })();
 
 // ---------- utils ----------
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){
@@ -474,9 +495,9 @@ function auditSolana(addr){
     if(!G&&!R)return {source:"none",available:false,reason:"no record on GoPlus or RugCheck"};
     var o={source:G&&R?"goplus+rugcheck":(G?"goplus":"rugcheck"),available:true,solana:true};
     if(G){
-      o.mintRevoked=G.mintAuth===null?null:!G.mintAuth;
-      o.freezeRevoked=G.freezeAuth===null?null:!G.freezeAuth;
-      o.metaImmutable=G.metaMutable===null?null:!G.metaMutable;
+      o.mintRevoked=G.mintAuth==null?null:!G.mintAuth;
+      o.freezeRevoked=G.freezeAuth==null?null:!G.freezeAuth;
+      o.metaImmutable=G.metaMutable==null?null:!G.metaMutable;
       o.balanceMutable=G.balanceMutable;o.transferHook=G.transferHook;
       o.top10=G.top10;o.lpLockedPct=G.lpLockedPct;o.holderCount=G.holderCount;
     }
@@ -545,15 +566,15 @@ function gate(pair,sec,econ){
       else if(r.level==="warn")add("wr","RugCheck: "+r.name);
     });
   } else {
-    crit(sec.honeypot===null?null:!sec.honeypot,"Not flagged as a honeypot","FLAGGED AS HONEYPOT — you cannot sell");
-    crit(sec.cannotSell===null?null:!sec.cannotSell,"Sell simulation succeeded","Sell simulation FAILED — cannot exit fully");
-    if(sec.sellTax===null){add("un","Couldn't verify: sell tax","unknown");if(strict)blockers.push("sell tax unverified");}
+    crit(sec.honeypot==null?null:!sec.honeypot,"Not flagged as a honeypot","FLAGGED AS HONEYPOT — you cannot sell");
+    crit(sec.cannotSell==null?null:!sec.cannotSell,"Sell simulation succeeded","Sell simulation FAILED — cannot exit fully");
+    if(sec.sellTax==null){add("un","Couldn't verify: sell tax","unknown");if(strict)blockers.push("sell tax unverified");}
     else if(sec.sellTax>C.maxSellTax){add("no","Sell tax "+sec.sellTax.toFixed(1)+"% over your "+C.maxSellTax+"% limit");blockers.push("sell tax "+sec.sellTax.toFixed(1)+"%");}
     else add("ok","Sell tax "+sec.sellTax.toFixed(1)+"%");
-    if(sec.buyTax===null){add("un","Couldn't verify: buy tax","unknown");if(strict)blockers.push("buy tax unverified");}
+    if(sec.buyTax==null){add("un","Couldn't verify: buy tax","unknown");if(strict)blockers.push("buy tax unverified");}
     else if(sec.buyTax>C.maxBuyTax){add("no","Buy tax "+sec.buyTax.toFixed(1)+"% over your "+C.maxBuyTax+"% limit");blockers.push("buy tax "+sec.buyTax.toFixed(1)+"%");}
     else add("ok","Buy tax "+sec.buyTax.toFixed(1)+"%");
-    crit(sec.mintable===null?null:!sec.mintable,"Not mintable","MINTABLE — supply can be inflated");
+    crit(sec.mintable==null?null:!sec.mintable,"Not mintable","MINTABLE — supply can be inflated");
     if(sec.ownerChangeBalance===true){add("no","Owner can change your balance");blockers.push("owner can change balances");}
     else if(sec.ownerChangeBalance===false)add("ok","Owner cannot change balances");
     if(sec.hiddenOwner===true){add("no","Hidden owner detected");blockers.push("hidden owner");}
@@ -626,63 +647,108 @@ function gate(pair,sec,econ){
 // at $5 the fee is the dominant term and pure slippage is nearly zero.
 // ===========================================================================
 var FACTORS=[
-  {k:"cost", n:"Cost efficiency (fees)", w:0.18},
-  {k:"liq",  n:"Liquidity depth vs FDV", w:0.15},
-  {k:"turn", n:"Volume turnover",        w:0.14},
-  {k:"flow", n:"Buy/sell pressure",      w:0.13},
-  {k:"trend",n:"Momentum consistency",   w:0.12},
-  {k:"room", n:"Headroom (FDV size)",    w:0.14},
-  {k:"dist", n:"Holder distribution",    w:0.09},
-  {k:"matur",n:"Maturity window",        w:0.05}
+  {k:"accel",n:"Acceleration (heating up)", w:0.20},
+  {k:"turn", n:"Volume turnover",           w:0.16},
+  {k:"room", n:"Headroom (FDV size)",       w:0.15},
+  {k:"flow", n:"Buy/sell pressure",         w:0.14},
+  {k:"liq",  n:"Liquidity depth vs FDV",    w:0.12},
+  {k:"cost", n:"Cost efficiency (fees)",    w:0.10},
+  {k:"dist", n:"Holder distribution",       w:0.08},
+  {k:"matur",n:"Maturity window",           w:0.05}
 ];
 
 function conviction(p,sec,econ){
   var C=S.cfg;
   var liq=num(p.liquidity&&p.liquidity.usd),fdv=num(p.fdv||p.marketCap);
   var vol=num(p.volume&&p.volume.h24);
+  var vol6=num(p.volume&&p.volume.h6),vol1=num(p.volume&&p.volume.h1);
   var m5=num(p.priceChange&&p.priceChange.m5),h1=num(p.priceChange&&p.priceChange.h1);
   var h6=num(p.priceChange&&p.priceChange.h6),h24=num(p.priceChange&&p.priceChange.h24);
   var tx=(p.txns&&p.txns.h24)||{},buys=num(tx.buys),sells=num(tx.sells);
+  var tx1=(p.txns&&p.txns.h1)||{},b1=num(tx1.buys),s1=num(tx1.sells);
   var age=ageH(p.pairCreatedAt);
   var f={};
 
-  // 1. Cost efficiency — how much of your stake survives the round trip.
+  // ---- 1. ACCELERATION: is activity building right now, or fading?
+  // Parabolic moves are preceded by volume and trade count accelerating,
+  // not by a price that already went vertical. Compares the most recent
+  // hour against the 24h average run-rate.
+  var hourlyAvg=vol/24;
+  var volAccel=hourlyAvg>0?vol1/hourlyAvg:1;          // >1 means heating up
+  var txAvg=(buys+sells)/24;
+  var txAccel=txAvg>0?(b1+s1)/txAvg:1;
+  var accelRaw=(volAccel*0.6+txAccel*0.4);
+  // 1x run-rate = 40, 2x = 70, 4x+ = ~95
+  f.accel=Math.max(0,Math.min(100,40+Math.log2(Math.max(accelRaw,0.15))*30));
+  // Punish a price that already ran without volume behind it
+  var shortMove=Math.max(Math.abs(m5),Math.abs(h1));
+  if(shortMove>25&&Math.abs(h6)<shortMove*0.35) f.accel=Math.max(0,f.accel-35);
+
+  // ---- 2. TURNOVER: real money changing hands vs pool size.
+  // Recalibrated: 1x daily turnover is already healthy for a microcap.
+  var turn=liq>0?vol/liq:0;
+  f.turn=Math.max(0,Math.min(100,(1-Math.exp(-turn/0.9))*100));
+
+  // ---- 3. HEADROOM: where the multiple-expansion room actually lives.
+  // Peak scoring in the $40K-$1.5M FDV band. Below that it's usually too
+  // new/illiquid to exit; above ~$20M a 10x needs enormous inflows.
+  if(fdv<=0) f.room=45;
+  else{
+    var lf=Math.log10(fdv);
+    if(lf<4.3) f.room=45+((lf-3.5)/0.8)*30;        // <20K: thin, risky
+    else if(lf<6.2) f.room=88+ (1-Math.abs(lf-5.2)/0.9)*12;  // 20K-1.5M: sweet spot
+    else if(lf<7.3) f.room=88-((lf-6.2)/1.1)*45;   // 1.5M-20M: tapering
+    else f.room=Math.max(5,43-((lf-7.3)/1.0)*35);  // >20M: little room
+    f.room=Math.max(0,Math.min(100,f.room));
+  }
+
+  // ---- 4. FLOW: buy dominance, rescaled so realistic ratios spread out.
+  // 50% = 45, 55% = 62, 60% = 78, 65%+ = 90+
+  var tot=buys+sells;
+  f.flow=tot>20?Math.max(0,Math.min(100,(buys/tot-0.5)*340+45)):40;
+
+  // ---- 5. LIQUIDITY DEPTH vs FDV. Real target is ~6%, not 12%.
+  var ratio=fdv>0?liq/fdv:0;
+  f.liq=Math.max(0,Math.min(100,(1-Math.exp(-ratio/0.035))*100));
+
+  // ---- 6. COST EFFICIENCY for your stake.
   f.cost=Math.max(0,Math.min(100,100-(econ.dragPct/C.maxFeeDragPct)*100));
 
-  var ratio=fdv>0?liq/fdv:0;
-  f.liq=Math.max(0,Math.min(100,(ratio/0.12)*100));
-
-  var turn=liq>0?vol/liq:0;
-  f.turn=Math.max(0,Math.min(100,(1-Math.exp(-turn/1.8))*100));
-
-  var tot=buys+sells;
-  f.flow=tot>20?Math.max(0,Math.min(100,(buys/tot)*145-22)):35;
-
-  var tf=[m5,h1,h6,h24].filter(function(x){return x!==0;});
-  var pos=tf.filter(function(x){return x>0;}).length;
-  var align=tf.length?pos/tf.length:0.5;
-  var avg=tf.length?tf.reduce(function(a,b){return a+b;},0)/tf.length:0;
-  var shortMove=Math.max(Math.abs(m5),Math.abs(h1));
-  var unsupported=shortMove>20&&Math.abs(h6)<shortMove*0.35;
-  var spikePenalty=unsupported?Math.min(95,25+(shortMove-20)*1.1):0;
-  f.trend=Math.max(0,Math.min(100,align*60+Math.min(40,Math.max(-20,avg*0.8))-spikePenalty));
-
-  // Headroom matters more for a small stack chasing multiples.
-  f.room=fdv>0?Math.max(0,Math.min(100,100-(Math.log10(Math.max(fdv,1e4))-4)/2.6*100)):45;
-
+  // ---- 7. DISTRIBUTION.
   var t10=(sec&&typeof sec.top10==="number"&&sec.top10>0)?sec.top10:null;
-  f.dist=t10==null?40:Math.max(0,Math.min(100,100-(t10/C.maxTop10)*100));
+  f.dist=t10==null?45:Math.max(0,Math.min(100,100-(t10/Math.max(C.maxTop10,1))*85));
 
-  if(age==null)f.matur=40;
-  else if(age<2)f.matur=15;
-  else if(age<12)f.matur=55+((age-2)/10)*35;
-  else if(age<96)f.matur=90;
-  else if(age<336)f.matur=Math.max(35,90-((age-96)/240)*55);
-  else f.matur=30;
+  // ---- 8. MATURITY WINDOW. Widened: real runs happen 4h-5d.
+  if(age==null)f.matur=45;
+  else if(age<2)f.matur=25;
+  else if(age<6)f.matur=60+((age-2)/4)*30;
+  else if(age<120)f.matur=92;
+  else if(age<336)f.matur=Math.max(45,92-((age-120)/216)*47);
+  else f.matur=40;
 
   var total=0;FACTORS.forEach(function(F){total+=f[F.k]*F.w;});
+
+  // ---- Hard caps. Some patterns are disqualifying no matter how good the
+  // rest of the numbers look, so they cap the grade rather than being
+  // averaged away by strong liquidity or headroom scores.
+  var caps=[];
+
+  // A price that went vertical with no base under it: you'd be the exit.
+  if(shortMove>25&&Math.abs(h6)<shortMove*0.35){ caps.push(54); }
+
+  // Actively dumping: sellers dominant AND activity cooling.
+  if(f.flow<=15&&f.accel<=20){ caps.push(52); }
+
+  // Nobody is trading it — you may not get out at any price.
+  if(f.turn<20){ caps.push(58); }
+
+  // Fees would eat most of a small stake.
+  if(econ.dragPct>C.maxFeeDragPct*0.8){ caps.push(60); }
+
+  if(caps.length) total=Math.min(total,Math.min.apply(null,caps));
+
   total=Math.round(total*10)/10;
-  return {total:total,f:f,grade:gradeOf(total)};
+  return {total:total,f:f,grade:gradeOf(total),capped:caps.length>0};
 }
 
 function gradeOf(s){
@@ -702,18 +768,19 @@ function gradeAtLeast(g,min){return GRADE_ORDER.indexOf(g)>=GRADE_ORDER.indexOf(
 
 function thesis(cv,econ){
   var f=cv.f,ups=[],downs=[];
-  var pos={cost:"cheap to trade at your size",liq:"deep liquidity for its size",
-    turn:"heavy trading relative to pool size",flow:"buyers outnumbering sellers",
-    trend:"momentum lined up across timeframes",room:"small enough to still multiply",
-    dist:"supply spread across many wallets",matur:"in the age window where moves happen"};
-  var neg={cost:"fees eat a real share of a small stake",liq:"liquidity is shallow versus its valuation",
-    turn:"volume is light for the pool size",flow:"sellers outweighing buyers",
-    trend:"price action is a single unsupported spike",room:"valuation already large, limiting upside",
+  var pos={accel:"activity accelerating right now",cost:"cheap to trade at your size",
+    liq:"deep liquidity for its size",turn:"heavy trading relative to pool size",
+    flow:"buyers clearly outnumbering sellers",room:"small enough to still multiply hard",
+    dist:"supply spread across many wallets",matur:"in the age window where runs happen"};
+  var neg={accel:"activity is cooling off, not building",cost:"fees eat a real share of a small stake",
+    liq:"liquidity is shallow versus its valuation",turn:"volume is light for the pool size",
+    flow:"sellers outweighing buyers",room:"valuation already large, limiting upside",
     dist:"supply concentrated in few wallets",matur:"outside the typical age window"};
   FACTORS.forEach(function(F){
     if(f[F.k]>=72)ups.push(pos[F.k]); else if(f[F.k]<=38)downs.push(neg[F.k]);
   });
   var s="<b>Grade "+cv.grade+"</b> ("+cv.total.toFixed(0)+"/100). ";
+  if(cv.capped) s+="<span style=\"color:var(--amber)\">Grade capped \u2014 a disqualifying pattern was detected regardless of its other numbers.</span> ";
   if(ups.length)s+="For: "+ups.slice(0,3).join(", ")+". ";
   if(downs.length)s+="Against: "+downs.slice(0,3).join(", ")+". ";
   if(!ups.length&&!downs.length)s+="Middling across every factor. ";
@@ -903,6 +970,244 @@ function lookupOne(q){
     });
 }
 
+// ===========================================================================
+// FRESH — newly launched pairs. Same audit, different tuning.
+// New tokens are where the biggest moves start AND where nearly all rugs
+// live, so this runs the identical security gate but relaxes only the age
+// floor, never a safety check.
+// ===========================================================================
+function runFresh(){
+  if(IS_LOCAL_FILE){S.localBlocked=true;render();return;}
+  S.freshLoading=true;S.freshErr=null;S.fresh=[];S.freshBlocked=[];render();
+
+  var TERMS=["SOL","WETH","USDC","WBNB","BASE","PUMP","AI","DOG","CAT","MEME","MOON","NEW"];
+  Promise.all(TERMS.map(function(t){
+    return fetchJSON(DS+"/latest/dex/search?q="+encodeURIComponent(t)).catch(function(){return {pairs:[]};});
+  })).then(function(res){
+    var best={},maxAge=S.cfg.freshMaxAgeH;
+    res.forEach(function(d){
+      ((d&&d.pairs)||[]).forEach(function(p){
+        if(S.chain!=="all"&&p.chainId!==S.chain)return;
+        var age=ageH(p.pairCreatedAt);
+        if(age==null||age>maxAge||age<S.cfg.freshMinAgeH)return;
+        var liq=num(p.liquidity&&p.liquidity.usd);
+        if(liq<S.cfg.freshMinLiq)return;
+        var k=(p.chainId||"")+":"+((p.baseToken&&p.baseToken.address)||"");
+        if(!best[k]||liq>num(best[k].liquidity&&best[k].liquidity.usd))best[k]=p;
+      });
+    });
+    var list=Object.keys(best).map(function(k){return best[k];});
+    // newest first — that's the point of this tab
+    list.sort(function(a,b){return num(b.pairCreatedAt)-num(a.pairCreatedAt);});
+    list=list.slice(0,40);
+    S.freshCoverage={found:list.length};
+    if(!list.length){S.freshLoading=false;render();return;}
+
+    var i=0,active=0,CONC=3,fin=false;
+    function done(){ if(fin)return;fin=true;
+      S.fresh.sort(function(a,b){return num(b.pairCreatedAt)-num(a.pairCreatedAt);});
+      S.freshLoading=false;render(); }
+    function pump(){
+      while(active<CONC&&i<list.length){
+        (function(p){
+          active++;
+          auditToken(p.chainId,(p.baseToken&&p.baseToken.address)||"")
+            .then(function(sec){p._sec=sec;})
+            .catch(function(){p._sec={available:false,reason:"audit failed"};})
+            .then(function(){
+              p._econ=tradeEconomics(p,p._sec);
+              p._gate=gate(p,p._sec,p._econ);
+              if(p._gate.verdict==="block")S.freshBlocked.push(p);
+              else{p._cv=conviction(p,p._sec,p._econ);S.fresh.push(p);}
+              active--;
+              if(i<list.length)setTimeout(pump,120); else if(active===0)done();
+            });
+        })(list[i++]);
+      }
+      if(i>=list.length&&active===0)done();
+    }
+    pump();
+  }).catch(function(e){
+    S.freshLoading=false;S.freshErr=(e&&e.message)||String(e);render();
+  });
+}
+
+// ===========================================================================
+// WATCHLIST — tokens you're tracking, re-audited on demand.
+// ===========================================================================
+function addWatch(addr){
+  addr=(addr||"").trim();
+  if(!addr){S.watchErr="Paste a contract address first.";render();return;}
+  if(S.watch.indexOf(addr)>=0){S.watchErr="Already on your watchlist.";render();return;}
+  S.watch.unshift(addr);S.watchInput="";S.watchErr=null;saveWatch();
+  refreshWatch();
+}
+function removeWatch(addr){
+  var i=S.watch.indexOf(addr);
+  if(i>=0){S.watch.splice(i,1);delete S.watchData[addr];saveWatch();render();}
+}
+function refreshWatch(){
+  if(IS_LOCAL_FILE){S.localBlocked=true;render();return;}
+  if(!S.watch.length){render();return;}
+  S.watchLoading=true;render();
+  var pending=S.watch.length;
+  S.watch.forEach(function(addr){
+    fetchJSON(DS+"/latest/dex/tokens/"+encodeURIComponent(addr))
+      .then(function(d){
+        var pairs=(d&&d.pairs)||[];
+        if(!pairs.length)throw new Error("no pair found");
+        pairs.sort(function(a,b){return num(b.liquidity&&b.liquidity.usd)-num(a.liquidity&&a.liquidity.usd);});
+        var p=pairs[0];
+        return auditToken(p.chainId,(p.baseToken&&p.baseToken.address)||addr).then(function(sec){
+          p._sec=sec;p._econ=tradeEconomics(p,sec);
+          p._gate=gate(p,sec,p._econ);p._cv=conviction(p,sec,p._econ);
+          S.watchData[addr]=p;
+        });
+      })
+      .catch(function(e){S.watchData[addr]={_err:(e&&e.message)||"lookup failed"};})
+      .then(function(){ if(--pending<=0){S.watchLoading=false;render();} });
+  });
+}
+
+// ---- wallet watchlist: deep links into free explorers ----
+function addWallet(a){
+  a=(a||"").trim();
+  if(!a)return;
+  if(S.wallets.indexOf(a)<0){S.wallets.unshift(a);saveWatch();}
+  S.walletInput="";render();
+}
+function removeWallet(a){
+  var i=S.wallets.indexOf(a);
+  if(i>=0){S.wallets.splice(i,1);saveWatch();render();}
+}
+function walletLinks(a){
+  var isSol=!/^0x/i.test(a);
+  if(isSol){
+    return [["Solscan","https://solscan.io/account/"+encodeURIComponent(a)],
+            ["GMGN","https://gmgn.ai/sol/address/"+encodeURIComponent(a)],
+            ["Cielo","https://app.cielo.finance/profile/"+encodeURIComponent(a)]];
+  }
+  return [["Etherscan","https://etherscan.io/address/"+encodeURIComponent(a)],
+          ["Basescan","https://basescan.org/address/"+encodeURIComponent(a)],
+          ["DeBank","https://debank.com/profile/"+encodeURIComponent(a)]];
+}
+
+// ===========================================================================
+// TRADE JOURNAL
+//
+// The part most retail tools leave out, and the part that actually compounds.
+// Logging entries turns "I think I do okay" into a measured hit rate, average
+// win, average loss, and expectancy — the numbers that tell you whether a
+// strategy is working before your balance does.
+// ===========================================================================
+function logTrade(p){
+  var cv=p._cv, econ=p._econ;
+  var t={
+    id:String(Date.now())+Math.floor(Math.random()*999),
+    chain:p.chainId,
+    addr:(p.baseToken&&p.baseToken.address)||"",
+    sym:(p.baseToken&&p.baseToken.symbol)||"?",
+    entry:num(p.priceUsd),
+    size:S.cfg.sizeUsd,
+    stopPct:S.cfg.stopPct,
+    tps:S.cfg.tp.slice(),
+    grade:cv?cv.grade:"?",
+    score:cv?cv.total:0,
+    costs:econ?econ.totalUsd:0,
+    opened:Date.now(),
+    status:"open",
+    exit:null, exitAt:null, pnl:null, note:""
+  };
+  S.trades.unshift(t);
+  saveTrades();
+  S.journalNote="Logged "+t.sym+" at "+px(t.entry)+" \u2014 open it in the Journal tab to track it.";
+  render();
+}
+
+function closeTrade(id,exitPrice){
+  var t=null;
+  for(var i=0;i<S.trades.length;i++) if(S.trades[i].id===id) t=S.trades[i];
+  if(!t)return;
+  exitPrice=num(exitPrice);
+  if(exitPrice<=0){S.journalNote="Enter the price you actually sold at.";render();return;}
+  var mult=t.entry>0?exitPrice/t.entry:0;
+  var gross=t.size*(mult-1);
+  t.exit=exitPrice; t.exitAt=Date.now(); t.status="closed";
+  t.pnl=gross-t.costs;              // net of the fees this trade cost
+  saveTrades(); render();
+}
+
+function deleteTrade(id){
+  S.trades=S.trades.filter(function(t){return t.id!==id;});
+  saveTrades();render();
+}
+
+// Live prices for open positions, so the journal shows where you actually are.
+function refreshTrades(){
+  if(IS_LOCAL_FILE){S.localBlocked=true;render();return;}
+  var open=S.trades.filter(function(t){return t.status==="open";});
+  if(!open.length){render();return;}
+  S.tradesLoading=true;render();
+  var pending=open.length;
+  open.forEach(function(t){
+    fetchJSON(DS+"/latest/dex/tokens/"+encodeURIComponent(t.addr))
+      .then(function(d){
+        var pairs=(d&&d.pairs)||[];
+        if(pairs.length){
+          pairs.sort(function(a,b){return num(b.liquidity&&b.liquidity.usd)-num(a.liquidity&&a.liquidity.usd);});
+          t.live=num(pairs[0].priceUsd);
+          t.liveAt=Date.now();
+        }
+      })
+      .catch(function(){})
+      .then(function(){ if(--pending<=0){S.tradesLoading=false;render();} });
+  });
+}
+
+// Aggregate performance. Expectancy is the number that matters: average
+// dollars per trade. Positive means the approach pays over repetition.
+function journalStats(){
+  var closed=S.trades.filter(function(t){return t.status==="closed";});
+  if(!closed.length)return null;
+  var wins=closed.filter(function(t){return t.pnl>0;});
+  var losses=closed.filter(function(t){return t.pnl<=0;});
+  var sum=function(a){return a.reduce(function(x,t){return x+t.pnl;},0);};
+  var totalPnl=sum(closed);
+  var avgWin=wins.length?sum(wins)/wins.length:0;
+  var avgLoss=losses.length?sum(losses)/losses.length:0;
+  var winRate=(wins.length/closed.length)*100;
+  var expectancy=totalPnl/closed.length;
+  var totalFees=closed.reduce(function(x,t){return x+(t.costs||0);},0);
+  // by grade, so you learn which grades are actually working for you
+  var byGrade={};
+  closed.forEach(function(t){
+    var g=t.grade||"?";
+    byGrade[g]=byGrade[g]||{n:0,pnl:0,w:0};
+    byGrade[g].n++; byGrade[g].pnl+=t.pnl; if(t.pnl>0)byGrade[g].w++;
+  });
+  return {n:closed.length,open:S.trades.length-closed.length,wins:wins.length,
+    losses:losses.length,winRate:winRate,avgWin:avgWin,avgLoss:avgLoss,
+    totalPnl:totalPnl,expectancy:expectancy,totalFees:totalFees,byGrade:byGrade};
+}
+
+function exportTradesCSV(){
+  var rows=[["symbol","chain","address","grade","score","entry","exit","size_usd","costs_usd","pnl_usd","opened","closed","status"]];
+  S.trades.forEach(function(t){
+    rows.push([t.sym,t.chain,t.addr,t.grade,t.score,t.entry,t.exit==null?"":t.exit,
+      t.size,(t.costs||0).toFixed(4),t.pnl==null?"":t.pnl.toFixed(4),
+      new Date(t.opened).toISOString(),t.exitAt?new Date(t.exitAt).toISOString():"",t.status]);
+  });
+  var csv=rows.map(function(r){return r.map(function(c){
+    var s=String(c==null?"":c); return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}).join(",");}).join("\n");
+  try{
+    var blob=new Blob([csv],{type:"text/csv"});
+    var url=URL.createObjectURL(blob);
+    var a=document.createElement("a");
+    a.href=url;a.download="ribbitpad-trades.csv";document.body.appendChild(a);a.click();
+    setTimeout(function(){document.body.removeChild(a);URL.revokeObjectURL(url);},500);
+  }catch(e){ S.journalNote="Couldn't export on this browser."; render(); }
+}
+
 function copyCA(a,btn){
   function ok(){btn.textContent="Copied";setTimeout(function(){btn.textContent="Copy";},1400);}
   if(navigator.clipboard&&navigator.clipboard.writeText)
@@ -996,6 +1301,10 @@ function cardHTML(p,isBlocked){
   }
 
   h+='<div class="ca"><code>'+esc(addr)+'</code><button data-copy="'+esc(addr)+'">Copy</button></div>';
+  if(!isBlocked&&cv){
+    h+='<div class="toolbar" style="padding:11px 0 0;border:none">'+
+       '<button class="primary" data-log="'+esc(addr)+'">\u270e Log this trade</button></div>';
+  }
   var links='';
   if(p.url)links+='<a href="'+esc(p.url)+'" target="_blank" rel="noopener">Chart ↗</a>';
   if(p.chainId==="solana")links+='<a href="https://rugcheck.xyz/tokens/'+esc(addr)+'" target="_blank" rel="noopener">RugCheck ↗</a>';
@@ -1167,6 +1476,191 @@ function scanPane(){
   return h;
 }
 
+function freshPane(){
+  var h='<div class="toolbar"><button class="primary" id="freshBtn">'+
+    (S.freshLoading?"Checking new launches…":"\ud83c\udf31 Find new launches")+'</button></div>'+chainBar();
+
+  h+='<div class="banner warn"><b>This is the highest-risk tab.</b> Tokens under '+
+    S.cfg.freshMaxAgeH+'h are where the biggest runs start and where almost every rug lives. '+
+    'The full security audit still applies here \u2014 nothing is relaxed except the age limit. '+
+    'Many will show as blocked because security providers haven\'t indexed them yet, and that '+
+    '<i>is</i> the correct answer for something this new.</div>';
+
+  if(S.localBlocked)return h+localFileNotice();
+  if(S.freshErr)return h+'<div class="banner err code">'+esc(S.freshErr)+'</div>';
+  if(S.freshLoading)return h+'<div class="empty"><div class="spinner"></div>Auditing new launches\u2026</div>';
+  if(!S.fresh.length&&!S.freshBlocked.length)
+    return h+'<div class="empty">Tap <b>Find new launches</b> to see pairs created in the last '+S.cfg.freshMaxAgeH+' hours.</div>';
+
+  if(S.fresh.length){
+    h+='<div class="banner info"><b>'+S.fresh.length+' new launches cleared the audit</b>'+
+      (S.freshBlocked.length?', '+S.freshBlocked.length+' blocked':'')+'. Newest first.</div>';
+    S.fresh.forEach(function(p){
+      var age=ageH(p.pairCreatedAt);
+      h+='<div style="padding:8px 18px 0;font-family:var(--mono);font-size:13px;color:var(--frog)">\u23f1 launched '+esc(ageLbl(age))+' ago</div>';
+      h+=cardHTML(p,false);
+    });
+  } else {
+    h+='<div class="banner warn"><b>None passed.</b> All '+S.freshBlocked.length+
+      ' new launches failed the audit \u2014 very common at this age.</div>';
+  }
+  if(S.freshBlocked.length&&!S.cfg.hideBlocked){
+    h+='<div class="banner err">\u26d4 '+S.freshBlocked.length+' blocked below.</div>';
+    S.freshBlocked.forEach(function(p){h+=cardHTML(p,true);});
+  }
+  return h;
+}
+
+function watchPane(){
+  var h='<div class="field"><label>Track a token</label>'+
+    '<input id="watchIn" placeholder="Paste contract address\u2026" autocapitalize="off" '+
+    'autocorrect="off" spellcheck="false" value="'+esc(S.watchInput)+'" />'+
+    '<div class="hint">Saved on this device. Tap refresh any time to re-audit and re-grade everything.</div></div>'+
+    '<div class="toolbar"><button class="primary" id="watchAdd">Add to watchlist</button>'+
+    (S.watch.length?'<button id="watchRef">'+(S.watchLoading?"Refreshing…":"Refresh all")+'</button>':'')+'</div>';
+
+  if(S.watchErr)h+='<div class="banner err">'+esc(S.watchErr)+'</div>';
+  if(S.localBlocked)return h+localFileNotice();
+
+  if(!S.watch.length){
+    h+='<div class="empty">Nothing tracked yet.<br><br>When you see a token mentioned anywhere \u2014 a group chat, a video, a friend \u2014 paste the address here to audit and grade it, then keep an eye on it.</div>';
+  } else {
+    S.watch.forEach(function(a){
+      var d=S.watchData[a];
+      if(!d){h+='<div class="card"><div class="mono" style="font-size:13px;color:var(--dim);word-break:break-all">'+esc(a)+'</div>'+
+        '<div style="margin-top:10px;color:var(--dim);font-size:14px">Not loaded yet \u2014 tap Refresh all.</div>'+
+        '<div class="toolbar" style="padding:12px 0 0;border:none"><button data-unwatch="'+esc(a)+'">Remove</button></div></div>';return;}
+      if(d._err){h+='<div class="card"><div class="mono" style="font-size:13px;word-break:break-all">'+esc(a)+'</div>'+
+        '<div style="margin-top:10px;color:var(--red);font-size:14px">'+esc(d._err)+'</div>'+
+        '<div class="toolbar" style="padding:12px 0 0;border:none"><button data-unwatch="'+esc(a)+'">Remove</button></div></div>';return;}
+      h+=cardHTML(d,d._gate.verdict==="block");
+      h+='<div class="toolbar" style="padding:0 18px 16px;border:none"><button data-unwatch="'+esc(a)+'">Remove from watchlist</button></div>';
+    });
+  }
+
+  // ---- wallet tracking ----
+  h+='<div class="field" style="border-top:1px solid var(--line)"><label>Track a wallet</label>'+
+    '<input id="walIn" placeholder="Paste wallet address\u2026" autocapitalize="off" '+
+    'autocorrect="off" spellcheck="false" value="'+esc(S.walletInput)+'" />'+
+    '<div class="hint">Saves the address and gives you one-tap links to see what it\'s been buying.</div></div>'+
+    '<div class="toolbar"><button class="primary" id="walAdd">Save wallet</button></div>';
+
+  h+='<div class="banner warn"><b>Why this isn\'t automatic.</b> Ranking wallets by success rate needs indexed on-chain data with profit/loss attribution \u2014 that\'s paid infrastructure (Nansen, Arkham, Cielo), not something a free site can compute. These links take you straight to free explorers where you can see a wallet\'s recent buys yourself, then paste any interesting token into the watchlist above.</div>';
+
+  if(S.wallets.length){
+    S.wallets.forEach(function(a){
+      h+='<div class="card"><div class="mono" style="font-size:13px;word-break:break-all;color:var(--text2)">'+esc(a)+'</div><div class="links">';
+      walletLinks(a).forEach(function(L){
+        h+='<a href="'+esc(L[1])+'" target="_blank" rel="noopener">'+esc(L[0])+' \u2197</a>';
+      });
+      h+='</div><div class="toolbar" style="padding:12px 0 0;border:none"><button data-unwallet="'+esc(a)+'">Remove</button></div></div>';
+    });
+  }
+  return h;
+}
+
+function journalPane(){
+  var st=journalStats();
+  var h='<div class="toolbar">'+
+    '<button class="primary" id="trRef">'+(S.tradesLoading?"Updating…":"Update prices")+'</button>'+
+    (S.trades.length?'<button id="trCsv">Export CSV</button>':'')+'</div>';
+
+  if(S.journalNote){h+='<div class="banner info">'+esc(S.journalNote)+'</div>';S.journalNote=null;}
+  if(S.localBlocked)return h+localFileNotice();
+
+  if(!S.trades.length){
+    return h+'<div class="banner info"><b>Why this tab matters more than the scanner.</b><br><br>'+
+      'Most people can\'t say what their actual hit rate is, so they never find out whether their approach works \u2014 they just watch the balance move. Logging every entry turns that into real numbers: win rate, average win vs average loss, and expectancy (average dollars per trade).<br><br>'+
+      'Expectancy is the one that matters. Positive means the approach pays over repetition. Negative means it doesn\'t, no matter how good any single trade felt.</div>'+
+      '<div class="empty">No trades logged yet.<br><br>When you buy something, tap <b>Log this trade</b> on its card in Scan, New, or Watch.</div>';
+  }
+
+  if(st){
+    var pc=st.totalPnl>=0?"var(--frog)":"var(--red)";
+    var ec=st.expectancy>=0?"var(--frog)":"var(--red)";
+    h+='<div class="feebox" style="margin:16px 18px"><div class="fh">Your performance \u2014 '+st.n+' closed trades</div>'+
+      '<div class="feerow"><span class="fk">Win rate</span><span>'+st.winRate.toFixed(0)+'% ('+st.wins+'W / '+st.losses+'L)</span></div>'+
+      '<div class="feerow"><span class="fk">Average win</span><span class="up">'+usd(st.avgWin)+'</span></div>'+
+      '<div class="feerow"><span class="fk">Average loss</span><span class="down">'+usd(st.avgLoss)+'</span></div>'+
+      '<div class="feerow"><span class="fk">Paid in fees</span><span>'+usd(st.totalFees)+'</span></div>'+
+      '<div class="feebig"><span class="fkb">Expectancy per trade</span><span style="color:'+ec+'">'+
+      (st.expectancy>=0?"+":"")+usd(st.expectancy)+'</span></div>'+
+      '<div class="feebig"><span class="fkb">Total net P&amp;L</span><span style="color:'+pc+'">'+
+      (st.totalPnl>=0?"+":"")+usd(st.totalPnl)+'</span></div></div>';
+
+    if(st.expectancy<0){
+      h+='<div class="banner warn"><b>Your expectancy is negative.</b> Across '+st.n+
+        ' closed trades you are losing an average of '+usd(Math.abs(st.expectancy))+
+        ' each time. That is worth knowing early \u2014 it usually means either the exits are too loose, '+
+        'the fees are too big a share of the size, or the entries aren\'t selective enough.</div>';
+    }
+
+    var gk=Object.keys(st.byGrade);
+    if(gk.length>1){
+      h+='<div class="factors" style="margin:0 18px"><div class="hd"><span>Results by grade</span><span>which grades work for you</span></div>';
+      ["A+","A","B+","B","C+","C","D","F"].forEach(function(g){
+        if(!st.byGrade[g])return;
+        var d=st.byGrade[g],c=d.pnl>=0?"var(--frog)":"var(--red)";
+        h+='<div class="fac"><span class="fl">Grade '+g+'</span>'+
+          '<span class="fw">'+d.n+' trades</span>'+
+          '<span class="fv" style="color:'+c+';width:auto">'+(d.pnl>=0?"+":"")+usd(d.pnl)+'</span></div>';
+      });
+      h+='</div>';
+    }
+  }
+
+  S.trades.forEach(function(t){
+    var open=t.status==="open";
+    var live=t.live||0;
+    var pnlPct=open&&live&&t.entry?((live-t.entry)/t.entry)*100:null;
+    var stopPrice=t.entry*(1-t.stopPct/100);
+    h+='<div class="card">';
+    h+='<div class="card-top"><div><div class="sym">'+esc(t.sym)+
+       '<span class="chaintag">'+esc(chainName(t.chain))+'</span></div>'+
+       '<div class="name">Grade '+esc(t.grade)+' \u00b7 '+usd(t.size)+' \u00b7 '+
+       new Date(t.opened).toLocaleDateString()+'</div></div>';
+    if(open&&pnlPct!==null){
+      var c=pnlPct>=0?"var(--frog)":"var(--red)";
+      h+='<div class="gradebox"><div class="grade" style="color:'+c+';font-size:26px">'+
+         (pnlPct>=0?"+":"")+pnlPct.toFixed(0)+'%</div><div class="gradelbl">live</div></div>';
+    } else if(!open){
+      var c2=t.pnl>=0?"var(--frog)":"var(--red)";
+      h+='<div class="gradebox"><div class="grade" style="color:'+c2+';font-size:22px">'+
+         (t.pnl>=0?"+":"")+usd(t.pnl)+'</div><div class="gradelbl">net</div></div>';
+    }
+    h+='</div>';
+
+    h+='<div class="levels"><div class="hd">'+(open?"Open position":"Closed")+'</div>'+
+      '<div class="lvl"><span class="lbl">Entry</span><span>'+px(t.entry)+'</span></div>';
+    if(open){
+      h+='<div class="lvl"><span class="lbl">Now</span><span>'+(live?px(live):"tap Update prices")+'</span></div>'+
+        '<div class="lvl sl"><span class="lbl">Your stop \u2212'+t.stopPct+'%</span><span class="down">'+px(stopPrice)+'</span></div>';
+      t.tps.forEach(function(m){
+        h+='<div class="lvl tp"><span class="lbl">Target '+m+'x</span><span class="up">'+px(t.entry*m)+'</span></div>';
+      });
+      if(live&&live<=stopPrice)
+        h+='<div class="lvl sl"><span class="lbl" style="color:var(--red)">\u26a0 Below your stop</span><span class="down">exit planned</span></div>';
+    } else {
+      h+='<div class="lvl"><span class="lbl">Exit</span><span>'+px(t.exit)+'</span></div>'+
+        '<div class="lvl"><span class="lbl">Fees paid</span><span>'+usd(t.costs||0)+'</span></div>';
+    }
+    h+='</div>';
+
+    if(open){
+      h+='<div class="field" style="padding:14px 0 0"><label>Sold it? Enter your exit price</label>'+
+        '<input class="exitIn" data-exit="'+esc(t.id)+'" inputmode="decimal" placeholder="e.g. 0.00084" /></div>'+
+        '<div class="toolbar" style="padding:12px 0 0;border:none">'+
+        '<button class="primary" data-close="'+esc(t.id)+'">Close trade</button>'+
+        '<button data-del="'+esc(t.id)+'">Delete</button></div>';
+    } else {
+      h+='<div class="toolbar" style="padding:12px 0 0;border:none">'+
+        '<button data-del="'+esc(t.id)+'">Delete</button></div>';
+    }
+    h+='</div>';
+  });
+  return h;
+}
+
 function lookupPane(){
   var h='<div class="field"><label>Contract address</label>'+
     '<input id="caInput" placeholder="Paste any token CA…" autocapitalize="off" autocorrect="off" '+
@@ -1227,6 +1721,14 @@ function cfgPane(){
 
   '<div class="field"><label>Min 24h volume</label><input id="cVol" type="number" inputmode="decimal" value="'+c.minVol+'" /></div>'+
 
+  '<div class="field"><label>New-launch window (hours)</label><div class="row2">'+
+  '<input id="cFreshMin" type="number" inputmode="decimal" step="0.5" value="'+c.freshMinAgeH+'" />'+
+  '<input id="cFreshMax" type="number" inputmode="decimal" value="'+c.freshMaxAgeH+'" /></div>'+
+  '<div class="hint">Age range for the <b>New</b> tab. Currently '+c.freshMinAgeH+'h to '+c.freshMaxAgeH+'h old. Under 30 minutes is usually unindexed by security providers, so it will just get blocked.</div></div>'+
+
+  '<div class="field"><label>New-launch minimum liquidity</label><input id="cFreshLiq" type="number" inputmode="decimal" value="'+c.freshMinLiq+'" />'+
+  '<div class="hint">Lower than the main scan since new pairs start small. Below ~$3K is rarely exitable.</div></div>'+
+
   '<div class="field"><label>Min / max pair age (hours)</label><div class="row2">'+
   '<input id="cMinAge" type="number" inputmode="decimal" value="'+c.minAgeH+'" />'+
   '<input id="cMaxAge" type="number" inputmode="decimal" value="'+c.maxAgeH+'" /></div></div>'+
@@ -1249,10 +1751,17 @@ function render(){
     stakeBar()+
     '<div class="tabs">'+
     '<button data-tab="scan" class="'+(S.tab==="scan"?"on":"")+'">Scan'+(shown?' <span class="n">'+shown+'</span>':'')+'</button>'+
-    '<button data-tab="lookup" class="'+(S.tab==="lookup"?"on":"")+'">Check CA</button>'+
-    '<button data-tab="cfg" class="'+(S.tab==="cfg"?"on":"")+'">Settings</button>'+
+    '<button data-tab="fresh" class="'+(S.tab==="fresh"?"on":"")+'">New'+(S.fresh.length?' <span class="n">'+S.fresh.length+'</span>':'')+'</button>'+
+    '<button data-tab="watch" class="'+(S.tab==="watch"?"on":"")+'">Watch'+(S.watch.length?' <span class="n">'+S.watch.length+'</span>':'')+'</button>'+
+    '<button data-tab="journal" class="'+(S.tab==="journal"?"on":"")+'">Log'+
+      (S.trades.filter(function(t){return t.status==="open";}).length?' <span class="n">'+S.trades.filter(function(t){return t.status==="open";}).length+'</span>':'')+'</button>'+
+    '<button data-tab="lookup" class="'+(S.tab==="lookup"?"on":"")+'">Check</button>'+
+    '<button data-tab="cfg" class="'+(S.tab==="cfg"?"on":"")+'">Set</button>'+
     '</div>'+
     '<div class="pane '+(S.tab==="scan"?"on":"")+'">'+(S.tab==="scan"?scanPane():"")+'</div>'+
+    '<div class="pane '+(S.tab==="fresh"?"on":"")+'">'+(S.tab==="fresh"?freshPane():"")+'</div>'+
+    '<div class="pane '+(S.tab==="watch"?"on":"")+'">'+(S.tab==="watch"?watchPane():"")+'</div>'+
+    '<div class="pane '+(S.tab==="journal"?"on":"")+'">'+(S.tab==="journal"?journalPane():"")+'</div>'+
     '<div class="pane '+(S.tab==="lookup"?"on":"")+'">'+(S.tab==="lookup"?lookupPane():"")+'</div>'+
     '<div class="pane '+(S.tab==="cfg"?"on":"")+'">'+(S.tab==="cfg"?cfgPane():"")+'</div>';
 
@@ -1282,6 +1791,42 @@ function render(){
     };});
 
   var r=document.getElementById("refresh");if(r)r.onclick=runScan;
+  var fb=document.getElementById("freshBtn");if(fb)fb.onclick=runFresh;
+
+  var wa=document.getElementById("watchAdd"),wi=document.getElementById("watchIn");
+  if(wa)wa.onclick=function(){addWatch(wi?wi.value:"");};
+  if(wi)wi.onkeydown=function(e){if(e.key==="Enter")addWatch(wi.value);};
+  var wr=document.getElementById("watchRef");if(wr)wr.onclick=refreshWatch;
+  Array.prototype.forEach.call(app.querySelectorAll("[data-unwatch]"),function(b){
+    b.onclick=function(){removeWatch(b.getAttribute("data-unwatch"));};});
+
+  var tr=document.getElementById("trRef");if(tr)tr.onclick=refreshTrades;
+  var tc=document.getElementById("trCsv");if(tc)tc.onclick=exportTradesCSV;
+  Array.prototype.forEach.call(app.querySelectorAll("[data-log]"),function(b){
+    b.onclick=function(){
+      var addr=b.getAttribute("data-log");
+      var pool=S.passed.concat(S.fresh);
+      Object.keys(S.watchData).forEach(function(k){var d=S.watchData[k];if(d&&!d._err)pool.push(d);});
+      if(S.lookup)pool.push(S.lookup);
+      for(var i=0;i<pool.length;i++){
+        var p=pool[i];
+        if(((p.baseToken&&p.baseToken.address)||"")===addr){logTrade(p);return;}
+      }
+    };});
+  Array.prototype.forEach.call(app.querySelectorAll("[data-close]"),function(b){
+    b.onclick=function(){
+      var id=b.getAttribute("data-close");
+      var inp=app.querySelector('.exitIn[data-exit="'+id+'"]');
+      closeTrade(id,inp?inp.value:0);
+    };});
+  Array.prototype.forEach.call(app.querySelectorAll("[data-del]"),function(b){
+    b.onclick=function(){deleteTrade(b.getAttribute("data-del"));};});
+
+  var va=document.getElementById("walAdd"),vi=document.getElementById("walIn");
+  if(va)va.onclick=function(){addWallet(vi?vi.value:"");};
+  if(vi)vi.onkeydown=function(e){if(e.key==="Enter")addWallet(vi.value);};
+  Array.prototype.forEach.call(app.querySelectorAll("[data-unwallet]"),function(b){
+    b.onclick=function(){removeWallet(b.getAttribute("data-unwallet"));};});
   var rb=document.getElementById("relaxBtn");
   if(rb)rb.onclick=function(){applyRelax(rb.getAttribute("data-relax"));runScan();};
   var dl=document.getElementById("doLookup");
@@ -1300,6 +1845,9 @@ function render(){
       return isFinite(v)&&v>=(min===undefined?0:min)?v:d;}
     var c=S.cfg;
     c.auditLimit=Math.min(200,Math.max(10,gv("cAudit",c.auditLimit,10)));
+    c.freshMinAgeH=gv("cFreshMin",c.freshMinAgeH);
+    c.freshMaxAgeH=Math.max(1,gv("cFreshMax",c.freshMaxAgeH,1));
+    c.freshMinLiq=gv("cFreshLiq",c.freshMinLiq);
     c.maxFeeDragPct=gv("cDrag",c.maxFeeDragPct,0.5);
     c.liqMultiple=gv("cLiqM",c.liqMultiple,1);
     c.minLiqFloor=gv("cLiqF",c.minLiqFloor,0);
