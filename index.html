@@ -292,6 +292,37 @@ var STAKES=[1,5,10,25,50,100];
 // Opened straight from the Files app? Browsers block network calls from
 // file:// origins, so the data APIs are unreachable. Detect it and say so
 // plainly rather than surfacing a confusing "API returned nothing" error.
+// ---------------------------------------------------------------------
+// Persistence. Settings survive reloads; audit results are cached for an
+// hour so repeat scans skip work already done. Contract security barely
+// changes hour to hour, and this is the single biggest speed win.
+// ---------------------------------------------------------------------
+var LS_OK=(function(){try{localStorage.setItem("_t","1");localStorage.removeItem("_t");return true;}catch(e){return false;}})();
+var AUDIT_TTL=60*60*1000;
+
+function cacheGet(chain,addr){
+  if(!LS_OK)return null;
+  try{
+    var raw=localStorage.getItem("rp:a:"+chain+":"+addr);
+    if(!raw)return null;
+    var o=JSON.parse(raw);
+    if(!o||!o.t||Date.now()-o.t>AUDIT_TTL){localStorage.removeItem("rp:a:"+chain+":"+addr);return null;}
+    return o.v;
+  }catch(e){return null;}
+}
+function cacheSet(chain,addr,val){
+  if(!LS_OK)return;
+  try{localStorage.setItem("rp:a:"+chain+":"+addr,JSON.stringify({t:Date.now(),v:val}));}
+  catch(e){ // storage full — clear our old audit entries and move on
+    try{Object.keys(localStorage).forEach(function(k){if(k.indexOf("rp:a:")===0)localStorage.removeItem(k);});}catch(e2){}
+  }
+}
+function saveCfg(){ if(LS_OK){try{localStorage.setItem("rp:cfg",JSON.stringify(S.cfg));}catch(e){}} }
+function loadCfg(){
+  if(!LS_OK)return null;
+  try{var r=localStorage.getItem("rp:cfg");return r?JSON.parse(r):null;}catch(e){return null;}
+}
+
 var IS_LOCAL_FILE = (typeof location!=="undefined") &&
   (location.protocol==="file:" || location.protocol==="content:" || location.origin==="null");
 
@@ -307,9 +338,13 @@ var S={
     liqMultiple:400,         // require liquidity >= stake * this
     minVol:5000, maxAgeH:336, minAgeH:1,
     maxBuyTax:5, maxSellTax:5, maxTop10:40,
-    strict:true, requireLpLock:true, hideBlocked:false, minGrade:"C"
-  }
+    strict:true, requireLpLock:true, hideBlocked:false, minGrade:"C",
+    auditLimit:100         // how many candidates to deep-audit per scan
+  },
+  coverage:null            // {found, chains, screened, audited} for transparency
 };
+
+(function(){ var saved=loadCfg(); if(saved){ for(var k in saved) if(S.cfg.hasOwnProperty(k)) S.cfg[k]=saved[k]; } })();
 
 // ---------- utils ----------
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){
@@ -454,7 +489,12 @@ function auditSolana(addr){
     return o;
   });
 }
-function auditToken(c,a){return c==="solana"?auditSolana(a):auditEvm(c,a);}
+function auditToken(c,a){
+  var hit=cacheGet(c,a);
+  if(hit) return Promise.resolve(hit);
+  var p=c==="solana"?auditSolana(a):auditEvm(c,a);
+  return p.then(function(sec){ if(sec&&sec.available) cacheSet(c,a,sec); return sec; });
+}
 
 // ===========================================================================
 // THE GATE
@@ -706,16 +746,40 @@ function preScreen(p){
 function runScan(){
   if(IS_LOCAL_FILE){ S.localBlocked=true; S.error=null; render(); return; }
   S.loading=true;S.error=null;S.localBlocked=false;S.passed=[];S.blocked=[];S.pct=0;
-  S.progress="Hopping across chains…";render();
+  S.progress="Sweeping every chain…";render();
 
   // Three sources. If the boost feeds are empty (they can be, briefly),
   // fall back to a broad search so the scan still returns something.
-  Promise.all([
+  // Widen the net. The boost feeds alone return ~30 promoted tokens, which is
+  // a narrow slice. Search queries pull live pairs per chain and per major
+  // quote asset, which surfaces far more of the actual market.
+  // Broad sweep. DexScreener has no "list every token" endpoint, so coverage
+  // comes from many distinct queries: chain natives, stablecoin pairs, and the
+  // narrative categories most new tokens name themselves after.
+  var SEARCH_TERMS=[
+    // chain natives / majors
+    "SOL","WETH","ETH","USDC","USDT","WBNB","BNB","MATIC","AVAX","ARB","OP",
+    "BASE","SUI","TON","BLAST","LINEA","CRO","FTM","SONIC","BERA",
+    // liquid memecoins that anchor big pair sets
+    "BONK","PEPE","WIF","SHIB","FLOKI","BRETT","MOG","TURBO","POPCAT","MEW",
+    // narrative categories new tokens cluster around
+    "AI","AGENT","DOG","CAT","FROG","MEME","MOON","INU","BABY","GROK",
+    "TRUMP","ELON","GAME","RWA","DEFI","L2","PUMP","CHAD","WOJAK","DEGEN"
+  ];
+  var sources=[
     fetchJSON(DS+"/token-boosts/latest/v1").catch(function(){return [];}),
-    fetchJSON(DS+"/token-boosts/top/v1").catch(function(){return [];})
-  ]).then(function(res){
-    var seen={},byChain={};
-    res.forEach(function(arr){
+    fetchJSON(DS+"/token-boosts/top/v1").catch(function(){return [];}),
+    fetchJSON(DS+"/token-profiles/latest/v1").catch(function(){return [];})
+  ];
+  var searches=SEARCH_TERMS.map(function(t){
+    return fetchJSON(DS+"/latest/dex/search?q="+encodeURIComponent(t))
+      .catch(function(){return {pairs:[]};});
+  });
+
+  Promise.all(sources.concat(searches)).then(function(res){
+    var seen={},byChain={},directPairs=[];
+    // First three are address-list feeds; the rest return full pair objects.
+    res.slice(0,3).forEach(function(arr){
       (Array.isArray(arr)?arr:[]).forEach(function(b){
         if(!b||!b.tokenAddress)return;
         var k=(b.chainId||"")+":"+b.tokenAddress;
@@ -723,15 +787,21 @@ function runScan(){
         (byChain[b.chainId||"unknown"]=byChain[b.chainId||"unknown"]||[]).push(b.tokenAddress);
       });
     });
-    var chains=Object.keys(byChain);
-    if(!chains.length){
-      // Boost feeds were empty — fall back to trending search results.
-      return fetchJSON(DS+"/latest/dex/search?q=SOL").then(function(d){
-        var ps=(d&&d.pairs)||[];
-        if(!ps.length) throw new Error("Market API returned no tokens. It may be briefly down or rate-limiting — try again in a minute.");
-        return [{pairs:ps}];
+    res.slice(3).forEach(function(d){
+      ((d&&d.pairs)||[]).forEach(function(p){
+        var a=(p.baseToken&&p.baseToken.address)||"";
+        if(!a)return;
+        var k=(p.chainId||"")+":"+a;
+        if(seen[k])return;seen[k]=1;
+        directPairs.push(p);
       });
+    });
+    S._directPairs=directPairs;
+    var chains=Object.keys(byChain);
+    if(!chains.length && !directPairs.length){
+      throw new Error("Market API returned no tokens. It may be briefly down or rate-limiting — try again in a minute.");
     }
+    if(!chains.length) return [];
     var lookups=[];
     chains.forEach(function(c){
       var a=byChain[c];
@@ -742,42 +812,71 @@ function runScan(){
     return Promise.all(lookups);
   }).then(function(results){
     var best={};
-    results.forEach(function(d){
-      ((d&&d.pairs)||[]).forEach(function(p){
-        var k=(p.chainId||"")+":"+((p.baseToken&&p.baseToken.address)||"");
-        var l=num(p.liquidity&&p.liquidity.usd);
-        if(!best[k]||l>num(best[k].liquidity&&best[k].liquidity.usd))best[k]=p;
-      });
-    });
-    var list=Object.keys(best).map(function(k){return best[k];}).filter(preScreen);
+    function consider(p){
+      var k=(p.chainId||"")+":"+((p.baseToken&&p.baseToken.address)||"");
+      var l=num(p.liquidity&&p.liquidity.usd);
+      if(!best[k]||l>num(best[k].liquidity&&best[k].liquidity.usd))best[k]=p;
+    }
+    results.forEach(function(d){((d&&d.pairs)||[]).forEach(consider);});
+    (S._directPairs||[]).forEach(consider);
+    S._directPairs=null;
+
+    var all=Object.keys(best).map(function(k){return best[k];});
+    var chainsSeen={};
+    all.forEach(function(p){chainsSeen[p.chainId||"?"]=1;});
+
+    var list=all.filter(preScreen);
     list.sort(function(a,b){return num(b.liquidity&&b.liquidity.usd)-num(a.liquidity&&a.liquidity.usd);});
-    list=list.slice(0,40);
+    var screened=list.length;
+    list=list.slice(0,S.cfg.auditLimit);
+
+    S.coverage={found:all.length, chains:Object.keys(chainsSeen).length,
+                screened:screened, audited:list.length};
+
     if(!list.length){S.loading=false;S.progress="";render();return;}
 
-    var i=0,done=0;
-    function next(){
-      if(i>=list.length){
-        S.passed.sort(function(a,b){return b._cv.total-a._cv.total;});
-        S.loading=false;S.progress="";S.pct=100;S.lastFetch=Date.now();render();return;
-      }
-      var p=list[i++];done++;
-      S.pct=Math.round((done/list.length)*100);
-      S.progress="Checking "+done+" of "+list.length+" · "+chainName(p.chainId);render();
-      auditToken(p.chainId,(p.baseToken&&p.baseToken.address)||"").then(function(sec){
-        p._sec=sec;
-        p._econ=tradeEconomics(p,sec);
-        p._gate=gate(p,sec,p._econ);
-        if(p._gate.verdict==="block")S.blocked.push(p);
-        else{p._cv=conviction(p,sec,p._econ);S.passed.push(p);}
-        setTimeout(next,240);
-      }).catch(function(){
+    // Concurrency pool. Cached entries resolve instantly, so this mostly
+    // parallelises the genuinely new lookups while staying polite to the
+    // free security APIs (3 in flight, small stagger between launches).
+    var i=0,done=0,active=0,CONC=3,finished=false;
+
+    function handle(p,sec,failed){
+      if(failed){
         p._sec={available:false,reason:"audit request failed"};
-        p._econ=tradeEconomics(p,null);
-        p._gate=gate(p,p._sec,p._econ);S.blocked.push(p);
-        setTimeout(next,240);
-      });
+      } else { p._sec=sec; }
+      p._econ=tradeEconomics(p,p._sec);
+      p._gate=gate(p,p._sec,p._econ);
+      if(p._gate.verdict==="block")S.blocked.push(p);
+      else{p._cv=conviction(p,p._sec,p._econ);S.passed.push(p);}
+      done++;
+      S.pct=Math.round((done/list.length)*100);
+      S.progress="Audited "+done+" of "+list.length+" \u00b7 "+S.passed.length+" passing";
+      if(done%3===0||done===list.length) render();
     }
-    next();
+
+    function finish(){
+      if(finished)return; finished=true;
+      S.passed.sort(function(a,b){return b._cv.total-a._cv.total;});
+      S.loading=false;S.progress="";S.pct=100;S.lastFetch=Date.now();render();
+    }
+
+    function pump(){
+      while(active<CONC && i<list.length){
+        (function(p){
+          active++;
+          auditToken(p.chainId,(p.baseToken&&p.baseToken.address)||"")
+            .then(function(sec){handle(p,sec,false);})
+            .catch(function(){handle(p,null,true);})
+            .then(function(){
+              active--;
+              if(i<list.length) setTimeout(pump,120);
+              else if(active===0) finish();
+            });
+        })(list[i++]);
+      }
+      if(i>=list.length && active===0) finish();
+    }
+    pump();
   }).catch(function(e){
     S.loading=false;S.progress="";S.error=(e&&e.message)||String(e);render();
   });
@@ -924,6 +1023,72 @@ function chainBar(){
   return h+'</div>';
 }
 
+// Groups the reasons tokens were rejected so the user can see at a glance
+// which filter is doing the blocking, instead of scrolling 19 cards.
+function blockReasonSummary(){
+  var counts={};
+  S.blocked.forEach(function(p){
+    (p._gate.blockers||[]).forEach(function(b){
+      // normalise variable text (percentages, sizes) into a stable label
+      var key=b.replace(/[\d.]+%/g,"%").replace(/\$[\d.,KMB]+/gi,"$X")
+              .replace(/top10 %/,"top-10 holders too concentrated")
+              .replace(/fee drag %/,"fees too high for your stake");
+      counts[key]=(counts[key]||0)+1;
+    });
+  });
+  return Object.keys(counts).map(function(k){return {r:k,n:counts[k]};})
+    .sort(function(a,b){return b.n-a.n;});
+}
+
+// Suggests which specific setting to change, based on what actually blocked.
+function relaxAdvice(top){
+  var r=(top&&top.r||"").toLowerCase();
+  if(r.indexOf("unverified")>=0||r.indexOf("no security data")>=0)
+    return {t:"Turn OFF Strict mode",d:"Most rejections are things the security APIs simply have no record of — common for very new tokens.",k:"strict"};
+  if(r.indexOf("lp")>=0||r.indexOf("liquidity locked")>=0||r.indexOf("lock")>=0)
+    return {t:"Turn OFF Require locked liquidity",d:"Many legitimate tokens don't report lock status in a way these APIs can read. Riskier, but it's what's blocking you.",k:"lp"};
+  if(r.indexOf("top-10")>=0||r.indexOf("top10")>=0)
+    return {t:"Raise Max top-10 holder %",d:"New tokens are usually concentrated. Try 60-70% instead of "+S.cfg.maxTop10+"%.",k:"top10"};
+  if(r.indexOf("thin")>=0||r.indexOf("liquidity")>=0)
+    return {t:"Lower the liquidity requirement",d:"Reduce 'liquidity needed per $1' or the absolute floor in Settings.",k:"liq"};
+  if(r.indexOf("fee")>=0||r.indexOf("drag")>=0)
+    return {t:"Raise Max total cost, or increase your stake",d:"At "+usd(S.cfg.sizeUsd)+" even small gas fees are a big share. $5-$10 gives more room.",k:"fee"};
+  if(r.indexOf("too new")>=0)
+    return {t:"Lower Min pair age",d:"Boosted tokens are often brand new. Note that under ~2h is genuinely the riskiest window.",k:"age"};
+  if(r.indexOf("liq/fdv")>=0)
+    return {t:"These have thin liquidity vs valuation",d:"That check catches tokens priced far above what backs them. Worth keeping on.",k:null};
+  return null;
+}
+
+function diagnosticPanel(){
+  var top=blockReasonSummary();
+  if(!top.length) return "";
+  var h='<div class="banner warn"><b>Why nothing passed</b><br><br>';
+  top.slice(0,5).forEach(function(x){
+    h+='<div style="display:flex;justify-content:space-between;gap:12px;padding:4px 0">'+
+       '<span>'+esc(x.r)+'</span><b style="color:#fff">'+x.n+'</b></div>';
+  });
+  h+='</div>';
+  var adv=relaxAdvice(top[0]);
+  if(adv){
+    h+='<div class="banner info"><b>Suggested fix: '+esc(adv.t)+'</b><br>'+esc(adv.d);
+    if(adv.k) h+='<br><br><span style="color:var(--frog);font-weight:700">Tap below to apply it and rescan.</span>';
+    h+='</div>';
+    if(adv.k) h+='<div class="toolbar"><button class="primary" id="relaxBtn" data-relax="'+adv.k+'">Apply fix &amp; rescan</button></div>';
+  }
+  return h;
+}
+
+function applyRelax(kind){
+  var c=S.cfg;
+  if(kind==="strict") c.strict=false;
+  else if(kind==="lp") c.requireLpLock=false;
+  else if(kind==="top10") c.maxTop10=Math.min(85,c.maxTop10+25);
+  else if(kind==="liq"){ c.liqMultiple=Math.max(50,c.liqMultiple/2); c.minLiqFloor=Math.max(2000,c.minLiqFloor/2); }
+  else if(kind==="fee") c.maxFeeDragPct=Math.min(50,c.maxFeeDragPct+15);
+  else if(kind==="age") c.minAgeH=0;
+}
+
 function localFileNotice(){
   return '<div class="banner warn">'+
     '<b>RibbitPad needs to be online to scan.</b><br><br>'+
@@ -965,6 +1130,17 @@ function scanPane(){
   var shown=S.passed.filter(function(p){return gradeAtLeast(p._cv.grade,S.cfg.minGrade);});
   var hidden=S.passed.length-shown.length;
 
+  if(S.coverage){
+    var cv=S.coverage;
+    h+='<div class="banner info"><b>Scan coverage</b><br><br>'+
+      '<div style="display:flex;justify-content:space-between;padding:3px 0"><span>Pairs found across '+cv.chains+' chains</span><b style="color:#fff">'+cv.found+'</b></div>'+
+      '<div style="display:flex;justify-content:space-between;padding:3px 0"><span>Passed pre-filter (liquidity, volume, age)</span><b style="color:#fff">'+cv.screened+'</b></div>'+
+      '<div style="display:flex;justify-content:space-between;padding:3px 0"><span>Deep-audited (contract security)</span><b style="color:#fff">'+cv.audited+'</b></div>'+
+      '<div style="display:flex;justify-content:space-between;padding:3px 0"><span>Search queries run</span><b style="color:#fff">53</b></div>'+
+      (cv.screened>cv.audited?'<br><span style="color:var(--dim)">'+(cv.screened-cv.audited)+' more qualified but weren\'t audited — raise the audit limit in Settings to include them.</span>':'')+
+      '</div>';
+  }
+
   if(shown.length){
     h+='<div class="banner warn"><b>'+shown.length+' graded '+S.cfg.minGrade+'+</b> of '+
       (S.passed.length+S.blocked.length)+' checked'+(hidden?', '+hidden+' lower hidden':'')+
@@ -975,7 +1151,7 @@ function scanPane(){
       '. Lower the minimum in Settings to see them.</div>';
   } else {
     h+='<div class="banner warn"><b>Nothing passed.</b> All '+S.blocked.length+
-      ' failed a check. Normal result — most tokens fail.</div>';
+      ' failed at least one check.</div>'+diagnosticPanel();
   }
 
   if(S.blocked.length&&!S.cfg.hideBlocked){
@@ -1024,6 +1200,9 @@ function cfgPane(){
   '<div class="tog"><div><div class="t">Hide blocked tokens</div><div class="s">Off by default — seeing what got caught shows the filter working.</div></div>'+sw("swHide",c.hideBlocked)+'</div>'+
 
   '<div class="field"><label>Minimum grade to show</label>'+gh+'</div>'+
+
+  '<div class="field"><label>How many tokens to audit per scan</label><input id="cAudit" type="number" inputmode="decimal" value="'+c.auditLimit+'" />'+
+  '<div class="hint">Audits run 3 at a time and results are cached for an hour, so rescans are much faster than the first run. 100 is a good balance; 200 is exhaustive.</div></div>'+
 
   '<div class="field"><label>Max total cost (% of stake)</label><input id="cDrag" type="number" inputmode="decimal" value="'+c.maxFeeDragPct+'" />'+
   '<div class="hint">Blocks trades where fees + slippage + taxes exceed this share. At '+usd(c.sizeUsd)+' that caps total cost at '+usd(c.sizeUsd*c.maxFeeDragPct/100)+'. This is the single most important setting for small trades.</div></div>'+
@@ -1087,7 +1266,7 @@ function render(){
     b.onclick=function(){copyCA(b.getAttribute("data-copy"),b);};});
   Array.prototype.forEach.call(app.querySelectorAll("[data-stake]"),function(b){
     b.onclick=function(){
-      S.cfg.sizeUsd=parseFloat(b.getAttribute("data-stake"));
+      S.cfg.sizeUsd=parseFloat(b.getAttribute("data-stake"));saveCfg();
       // recompute economics for everything already scanned
       S.passed.concat(S.blocked).forEach(function(p){
         p._econ=tradeEconomics(p,p._sec);
@@ -1103,6 +1282,8 @@ function render(){
     };});
 
   var r=document.getElementById("refresh");if(r)r.onclick=runScan;
+  var rb=document.getElementById("relaxBtn");
+  if(rb)rb.onclick=function(){applyRelax(rb.getAttribute("data-relax"));runScan();};
   var dl=document.getElementById("doLookup");
   if(dl)dl.onclick=function(){var e=document.getElementById("caInput");
     S.lastQuery=e?e.value:"";lookupOne(S.lastQuery);};
@@ -1110,7 +1291,7 @@ function render(){
   if(ci)ci.onkeydown=function(e){if(e.key==="Enter"){S.lastQuery=ci.value;lookupOne(ci.value);}};
 
   function bind(id,k){var el=document.getElementById(id);
-    if(el)el.onclick=function(){S.cfg[k]=!S.cfg[k];render();};}
+    if(el)el.onclick=function(){S.cfg[k]=!S.cfg[k];saveCfg();render();};}
   bind("swStrict","strict");bind("swLp","requireLpLock");bind("swHide","hideBlocked");
 
   var sv=document.getElementById("saveCfg");
@@ -1118,6 +1299,7 @@ function render(){
     function gv(id,d,min){var e=document.getElementById(id);var v=e?parseFloat(e.value):NaN;
       return isFinite(v)&&v>=(min===undefined?0:min)?v:d;}
     var c=S.cfg;
+    c.auditLimit=Math.min(200,Math.max(10,gv("cAudit",c.auditLimit,10)));
     c.maxFeeDragPct=gv("cDrag",c.maxFeeDragPct,0.5);
     c.liqMultiple=gv("cLiqM",c.liqMultiple,1);
     c.minLiqFloor=gv("cLiqF",c.minLiqFloor,0);
@@ -1128,6 +1310,7 @@ function render(){
     var t=document.getElementById("cTp");
     if(t){var pr=t.value.split(",").map(function(x){return parseFloat(x.trim());})
       .filter(function(x){return isFinite(x)&&x>1;});if(pr.length)c.tp=pr;}
+    saveCfg();
     S.tab="scan";render();
   };
 }
