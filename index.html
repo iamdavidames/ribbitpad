@@ -441,17 +441,17 @@ function saveWatch(){ if(LS_OK){try{
 }catch(e){}} }
 function saveHunts(){ if(LS_OK){try{localStorage.setItem("rp:hunts",JSON.stringify(S.hunts));}catch(e){}} }
 function loadHunts(){ if(!LS_OK)return;
-  try{var x=localStorage.getItem("rp:hunts"); if(x) S.hunts=JSON.parse(x)||[];}catch(e){} }
+  try{var x=localStorage.getItem("rp:hunts"); if(x){var p=JSON.parse(x);S.hunts=Array.isArray(p)?p:[];}}catch(e){S.hunts=[];} }
 function saveTrades(){ if(LS_OK){try{localStorage.setItem("rp:trades",JSON.stringify(S.trades));}catch(e){}} }
 function loadTrades(){
   if(!LS_OK)return;
-  try{var t=localStorage.getItem("rp:trades"); if(t) S.trades=JSON.parse(t)||[];}catch(e){}
+  try{var t=localStorage.getItem("rp:trades"); if(t){var pt=JSON.parse(t);S.trades=Array.isArray(pt)?pt:[];}}catch(e){S.trades=[];}
 }
 function loadWatch(){
   if(!LS_OK)return;
   try{
-    var w=localStorage.getItem("rp:watch"); if(w) S.watch=JSON.parse(w)||[];
-    var v=localStorage.getItem("rp:wallets"); if(v) S.wallets=JSON.parse(v)||[];
+    var w=localStorage.getItem("rp:watch"); if(w){var pw=JSON.parse(w);S.watch=Array.isArray(pw)?pw:[];}
+    var v=localStorage.getItem("rp:wallets"); if(v){var pv=JSON.parse(v);S.wallets=Array.isArray(pv)?pv:[];}
   }catch(e){}
 }
 function loadCfg(){
@@ -465,7 +465,7 @@ var IS_LOCAL_FILE = (typeof location!=="undefined") &&
 var S={
   tab:"scan",loading:false,progress:"",pct:0,error:null,localBlocked:false,
   passed:[],blocked:[],unverified:[],lastFetch:null,chain:"all",
-  lookup:null,lookupErr:null,lookupLoading:false,lastQuery:"",
+  lookup:null,lookupErr:null,lookupLoading:false,lastQuery:"",similarNote:null,hunts:[],
   cfg:{
     stopPct:35, tp:[2,4,10], sizeUsd:5,
     maxFeeDragPct:15,        // block if round-trip fees exceed this % of stake
@@ -487,7 +487,32 @@ var S={
   watching:false, watchTimer:null, alerts:[], notifOk:false
 };
 
-(function(){ var saved=loadCfg(); if(saved){ for(var k in saved) if(S.cfg.hasOwnProperty(k)) S.cfg[k]=saved[k]; if(saved.seenIntro)S.seenIntro=true; } loadWatch(); loadTrades(); loadHunts(); })();
+// Saved settings are merged type-by-type. A corrupted or hand-edited value
+// must never be able to break startup — anything of the wrong type is ignored
+// and the default kept.
+(function(){
+  var saved=loadCfg();
+  if(saved){
+    for(var k in saved){
+      if(!S.cfg.hasOwnProperty(k))continue;
+      var def=S.cfg[k], val=saved[k];
+      if(Array.isArray(def)){
+        if(Array.isArray(val)){
+          var nums=val.map(Number).filter(function(x){return isFinite(x)&&x>0;});
+          if(nums.length)S.cfg[k]=nums;
+        }
+      } else if(typeof def==="number"){
+        var n=Number(val); if(isFinite(n))S.cfg[k]=n;
+      } else if(typeof def==="boolean"){
+        if(typeof val==="boolean")S.cfg[k]=val;
+      } else if(typeof def==="string"){
+        if(typeof val==="string")S.cfg[k]=val;
+      }
+    }
+    if(saved.seenIntro===true)S.seenIntro=true;
+  }
+  loadWatch(); loadTrades(); loadHunts();
+})();
 
 // ---------- utils ----------
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){
@@ -2459,6 +2484,8 @@ function applySimilar(p){
 // than copying one. A single token is a sample of one — its FDV band could be
 // coincidence. Traits that recur across three or four are at least a pattern.
 function addHunt(p){
+  if(!p||!p._cv)return;
+  if(!Array.isArray(S.hunts))S.hunts=[];
   var pr=similarProfile(p);
   var sym=(p.baseToken&&p.baseToken.symbol)||"?";
   S.hunts.unshift({
@@ -2473,11 +2500,11 @@ function addHunt(p){
   S.journalNote=sym+" saved. Save a few winners and hunt what they have in common.";
   render();
 }
-function removeHunt(id){ S.hunts=S.hunts.filter(function(x){return x.id!==id;}); saveHunts(); render(); }
+function removeHunt(id){ if(!Array.isArray(S.hunts))S.hunts=[];S.hunts=S.hunts.filter(function(x){return x.id!==id;}); saveHunts(); render(); }
 
 // Build the overlap across every saved profile.
 function compositeHunt(){
-  if(!S.hunts.length)return null;
+  if(!Array.isArray(S.hunts)||!S.hunts.length)return null;
   var chains={};
   S.hunts.forEach(function(x){chains[x.chain]=(chains[x.chain]||0)+1;});
   var topChain=Object.keys(chains).sort(function(a,b){return chains[b]-chains[a];})[0];
@@ -2516,6 +2543,7 @@ function applyComposite(){
 }
 
 function huntsHTML(){
+  if(!Array.isArray(S.hunts))S.hunts=[];
   var h='<div class="field" style="border-top:1px solid var(--line)"><label>Your hunt list</label>'+
     '<div class="hint" style="margin-top:0">Save tokens that already ran. RibbitPad works out what they had '+
     'in common and points the scan at that profile. Three or four gives a real pattern; one is a coincidence.</div></div>';
