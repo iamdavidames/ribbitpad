@@ -477,10 +477,11 @@ var S={
     strict:true, requireLpLock:true, hideBlocked:false, minGrade:"C",
     auditLimit:100,        // how many candidates to deep-audit per scan
     freshMaxAgeH:48, freshMinAgeH:0.5, freshMinLiq:5000, freshSortBySurge:true,
-    maxOpenPositions:5, maxExposureUsd:50, dailyLossLimit:20, maxCreatorPct:10, seenIntro:false
+    maxOpenPositions:5, maxExposureUsd:50, dailyLossLimit:20, maxCreatorPct:10, seenIntro:false, heatThreshold:35
   },
   coverage:null,           // {found, chains, screened, audited} for transparency
   fresh:[], freshBlocked:[], freshUnverified:[], freshLoading:false, freshErr:null, freshCoverage:null,
+  heat:[], heatUnverified:[], heatLoading:false, heatErr:null, heatCoverage:null,
   watch:[], watchData:{}, watchLoading:false, watchErr:null, watchInput:"",
   wallets:[], walletInput:"",
   trades:[], tradesLoading:false, journalNote:null, expanded:{}, seenIntro:false,
@@ -840,6 +841,16 @@ function gate(pair,sec,econ){
   var tx=(pair.txns&&pair.txns.h24)||{},b=num(tx.buys),sl=num(tx.sells);
   if(b+sl>50&&sl>b*1.6){add("wr","Sells outpacing buys "+sl+"/"+b);warns.push("sell pressure");}
 
+  // Liquidity actively leaving the pool is a block, not a warning.
+  var dmp=pair._dump||dumpRisk(pair,sec);
+  if(dmp){
+    dmp.flags.forEach(function(f){
+      if(f.s==="bad"){add("no",f.t);blockers.push(f.t.split(" \u2014 ")[0]);}
+      else if(f.s==="wr"){add("wr",f.t);warns.push(f.t.split(" \u2014 ")[0]);}
+      else add("ok",f.t);
+    });
+  }
+
   var m5=num(pair.priceChange&&pair.priceChange.m5),h1w=num(pair.priceChange&&pair.priceChange.h1);
   var h6w=Math.abs(num(pair.priceChange&&pair.priceChange.h6));
   var shortW=Math.max(Math.abs(m5),Math.abs(h1w));
@@ -884,6 +895,7 @@ var FACTORS=[
 
 function conviction(p,sec,econ){
   var C=S.cfg;
+  if(!p._dump)p._dump=dumpRisk(p,sec);
   var liq=num(p.liquidity&&p.liquidity.usd),fdv=num(p.fdv||p.marketCap);
   var vol=num(p.volume&&p.volume.h24);
   var vol6=num(p.volume&&p.volume.h6),vol1=num(p.volume&&p.volume.h1);
@@ -957,6 +969,16 @@ function conviction(p,sec,econ){
   // rest of the numbers look, so they cap the grade rather than being
   // averaged away by strong liquidity or headroom scores.
   var caps=[];
+
+  // Downside signals cap the grade outright. A token bleeding liquidity or
+  // already 5x up must never show A+ because its other numbers look tidy —
+  // that is exactly the failure this is here to prevent.
+  var dr=p._dump;
+  if(dr){
+    if(dr.severe>=2) caps.push(38);        // D or worse
+    else if(dr.severe===1) caps.push(52);  // C
+    else if(dr.flags.filter(function(f){return f.s==="wr";}).length>=2) caps.push(64);
+  }
 
   // A price that went vertical with no base under it: you'd be the exit.
   if(shortMove>25&&Math.abs(h6)<shortMove*0.35){ caps.push(54); }
@@ -1215,7 +1237,8 @@ function lookupOne(q){
       pairs.sort(function(a,b){return num(b.liquidity&&b.liquidity.usd)-num(a.liquidity&&a.liquidity.usd);});
       var p=pairs[0];
       return auditToken(p.chainId,(p.baseToken&&p.baseToken.address)||q).then(function(sec){
-        p._sec=sec;p._econ=tradeEconomics(p,sec);
+        p._sec=sec;snapRecord(p,sec);p._dump=dumpRisk(p,sec);
+        p._econ=tradeEconomics(p,sec);
         p._gate=gate(p,sec,p._econ);p._cv=conviction(p,sec,p._econ);
         S.lookup=p;S.lookupLoading=false;render();
       });
@@ -1230,6 +1253,79 @@ function lookupOne(q){
 // live, so this runs the identical security gate but relaxes only the age
 // floor, never a safety check.
 // ===========================================================================
+function runHeat(){
+  if(IS_LOCAL_FILE){S.localBlocked=true;render();return;}
+  S.heatLoading=true;S.heatErr=null;S.heat=[];S.heatUnverified=[];render();
+
+  var nets=S.chain==="all"
+    ? GT_NETS.map(function(p){return p[0];})
+    : GT_NETS.filter(function(p){return p[1]===S.chain;}).map(function(p){return p[0];});
+
+  // Trending and volume-sorted feeds surface active pairs; we then keep only
+  // the ones still in the build phase.
+  var calls=[];
+  nets.slice(0,10).forEach(function(net){
+    calls.push(gtFetch("/networks/"+net+"/trending_pools"));
+    calls.push(gtFetch("/networks/"+net+"/pools?sort=h24_volume_usd_desc"));
+  });
+  calls.push(gtFetch("/networks/trending_pools?page=1"));
+  calls.push(gtFetch("/networks/trending_pools?page=2"));
+
+  Promise.all(calls).then(function(res){
+    var best={},all=[];
+    res.forEach(function(a){all=all.concat(Array.isArray(a)?a:[]);});
+    all.forEach(function(p){
+      if(!p||!p.baseToken)return;
+      if(S.chain!=="all"&&p.chainId!==S.chain)return;
+      var liq=num(p.liquidity&&p.liquidity.usd);
+      if(liq<Math.max(S.cfg.freshMinLiq,S.cfg.sizeUsd*40))return;
+      var hs=heatScore(p);
+      if(!hs||hs.score<S.cfg.heatThreshold)return;
+      if(hs.alreadyRan)return;                 // the whole point is to be early
+      p._heat=hs;
+      var k=(p.chainId||"")+":"+p.baseToken.address;
+      if(!best[k]||hs.score>(best[k]._heat.score))best[k]=p;
+    });
+    var list=Object.keys(best).map(function(k){return best[k];});
+    list.sort(function(a,b){return b._heat.score-a._heat.score;});
+    list=list.slice(0,30);
+    S.heatCoverage={found:all.length,building:list.length};
+    if(!list.length){S.heatLoading=false;render();return;}
+
+    var i=0,active=0,CONC=3,fin=false;
+    function done(){if(fin)return;fin=true;
+      S.heat.sort(function(a,b){return b._heat.score-a._heat.score;});
+      S.heatLoading=false;render();}
+    function pump(){
+      while(active<CONC&&i<list.length){
+        (function(p){
+          active++;
+          auditToken(p.chainId,(p.baseToken&&p.baseToken.address)||"")
+            .then(function(sec){p._sec=sec;})
+            .catch(function(){p._sec={available:false,reason:"audit failed"};})
+            .then(function(){
+              snapRecord(p,p._sec);
+              p._dump=dumpRisk(p,p._sec);
+              p._confirm=heatConfirmation(p);
+              p._econ=tradeEconomics(p,p._sec);
+              p._gate=gate(p,p._sec,p._econ);
+              if(p._gate.verdict==="block"){/* dropped */}
+              else if(p._gate.verdict==="unverified"){
+                p._cv=conviction(p,p._sec,p._econ);S.heatUnverified.push(p);}
+              else {p._cv=conviction(p,p._sec,p._econ);S.heat.push(p);}
+              active--;
+              if(i<list.length)setTimeout(pump,120); else if(active===0)done();
+            });
+        })(list[i++]);
+      }
+      if(i>=list.length&&active===0)done();
+    }
+    pump();
+  }).catch(function(e){
+    S.heatLoading=false;S.heatErr=(e&&e.message)||String(e);render();
+  });
+}
+
 function runFresh(){
   if(IS_LOCAL_FILE){S.localBlocked=true;render();return;}
   S.freshLoading=true;S.freshErr=null;S.fresh=[];S.freshBlocked=[];S.freshUnverified=[];render();
@@ -1293,6 +1389,8 @@ function runFresh(){
             .then(function(sec){p._sec=sec;})
             .catch(function(){p._sec={available:false,reason:"audit failed"};})
             .then(function(){
+              snapRecord(p,p._sec);
+              p._dump=dumpRisk(p,p._sec);
               p._econ=tradeEconomics(p,p._sec);
               p._gate=gate(p,p._sec,p._econ);
               if(p._gate.verdict==="block")S.freshBlocked.push(p);
@@ -1339,7 +1437,8 @@ function refreshWatch(){
         pairs.sort(function(a,b){return num(b.liquidity&&b.liquidity.usd)-num(a.liquidity&&a.liquidity.usd);});
         var p=pairs[0];
         return auditToken(p.chainId,(p.baseToken&&p.baseToken.address)||addr).then(function(sec){
-          p._sec=sec;p._econ=tradeEconomics(p,sec);
+          p._sec=sec;snapRecord(p,sec);p._dump=dumpRisk(p,sec);
+          p._econ=tradeEconomics(p,sec);
           p._gate=gate(p,sec,p._econ);p._cv=conviction(p,sec,p._econ);
           S.watchData[addr]=p;
         });
@@ -1624,6 +1723,263 @@ function exportTradesCSV(){
   }catch(e){ S.journalNote="Couldn't export on this browser."; render(); }
 }
 
+// ===========================================================================
+// SNAPSHOT TRACKING  —  the missing dimension
+//
+// Every check up to here has been a snapshot: what does this token look like
+// right now. But the things that precede a nuke are CHANGES — liquidity being
+// withdrawn, volume dying while price holds up, the deployer's stake growing.
+// None of that is visible in a single observation.
+//
+// So every token seen is recorded locally. On any later sighting the deltas
+// are computed, and a falling liquidity line is treated as what it usually is:
+// a rug in progress.
+// ===========================================================================
+function snapKey(chain,addr){return "rp:s:"+chain+":"+String(addr).toLowerCase();}
+
+function snapRecord(p,sec){
+  if(!LS_OK)return;
+  var addr=(p.baseToken&&p.baseToken.address)||""; if(!addr)return;
+  try{
+    var k=snapKey(p.chainId,addr);
+    var prev=[];
+    var raw=localStorage.getItem(k);
+    if(raw){var pr=JSON.parse(raw);if(Array.isArray(pr))prev=pr;}
+    prev.push({
+      t:Date.now(),
+      liq:num(p.liquidity&&p.liquidity.usd),
+      px:num(p.priceUsd),
+      fdv:num(p.fdv||p.marketCap),
+      v24:num(p.volume&&p.volume.h24),
+      dev:(sec&&sec.creatorPct!=null)?sec.creatorPct:null,
+      t10:(sec&&typeof sec.top10==="number")?sec.top10:null
+    });
+    // keep a short history; drop anything older than a week
+    var cutoff=Date.now()-7*24*3600*1000;
+    prev=prev.filter(function(x){return x.t>cutoff;}).slice(-12);
+    localStorage.setItem(k,JSON.stringify(prev));
+  }catch(e){
+    // storage full — clear old snapshots and carry on
+    try{Object.keys(localStorage).forEach(function(kk){
+      if(kk.indexOf("rp:s:")===0)localStorage.removeItem(kk);});}catch(e2){}
+  }
+}
+
+function snapHistory(p){
+  if(!LS_OK)return null;
+  var addr=(p.baseToken&&p.baseToken.address)||""; if(!addr)return null;
+  try{
+    var raw=localStorage.getItem(snapKey(p.chainId,addr));
+    if(!raw)return null;
+    var arr=JSON.parse(raw);
+    if(!Array.isArray(arr)||arr.length<1)return null;
+    return arr;
+  }catch(e){return null;}
+}
+
+// Compare now against the earliest useful past observation.
+function snapDelta(p,sec){
+  var hist=snapHistory(p);
+  if(!hist||!hist.length)return null;
+  var first=hist[0];
+  var ageMin=(Date.now()-first.t)/60000;
+  if(ageMin<3)return null;                       // too recent to mean anything
+
+  var liqNow=num(p.liquidity&&p.liquidity.usd);
+  var pxNow=num(p.priceUsd);
+  var v24Now=num(p.volume&&p.volume.h24);
+  var devNow=(sec&&sec.creatorPct!=null)?sec.creatorPct:null;
+
+  var d={
+    minutes:ageMin, samples:hist.length,
+    liqPct: first.liq>0 ? ((liqNow-first.liq)/first.liq)*100 : null,
+    pxPct:  first.px>0  ? ((pxNow-first.px)/first.px)*100   : null,
+    volPct: first.v24>0 ? ((v24Now-first.v24)/first.v24)*100 : null,
+    devDelta: (devNow!=null&&first.dev!=null) ? devNow-first.dev : null
+  };
+  return d;
+}
+
+// Turn those deltas into explicit dump-risk flags.
+function dumpRisk(p,sec){
+  var d=snapDelta(p,sec);
+  var flags=[], severe=0;
+
+  // 1. Liquidity leaving is the clearest rug-in-progress signal there is.
+  if(d&&d.liqPct!=null){
+    if(d.liqPct<=-30){flags.push({s:"bad",t:"Liquidity down "+Math.abs(d.liqPct).toFixed(0)+"% since first seen — liquidity is being withdrawn"});severe++;}
+    else if(d.liqPct<=-12)flags.push({s:"wr",t:"Liquidity down "+Math.abs(d.liqPct).toFixed(0)+"% since first seen"});
+    else if(d.liqPct>=15)flags.push({s:"ok",t:"Liquidity up "+d.liqPct.toFixed(0)+"% since first seen"});
+  }
+  // 2. Deployer accumulating back into their own token before a sell.
+  if(d&&d.devDelta!=null&&d.devDelta>=2){
+    flags.push({s:"bad",t:"Deployer's stake grew "+d.devDelta.toFixed(1)+" points since first seen"});severe++;
+  }
+  // 3. Price holding while volume collapses = distribution into thin bids.
+  if(d&&d.volPct!=null&&d.pxPct!=null&&d.volPct<=-45&&d.pxPct>-5){
+    flags.push({s:"wr",t:"Volume down "+Math.abs(d.volPct).toFixed(0)+"% while price held — interest is fading"});
+  }
+
+  // --- snapshot-only downside signals (work on first sighting too) ---
+  var h24=num(p.priceChange&&p.priceChange.h24);
+  var h6=num(p.priceChange&&p.priceChange.h6);
+  var liq=num(p.liquidity&&p.liquidity.usd);
+  var fdv=num(p.fdv||p.marketCap);
+  var v24=num(p.volume&&p.volume.h24);
+
+  // 4. Already ran hard — you would be buying someone else's exit.
+  if(h24>=300){flags.push({s:"bad",t:"Already up "+h24.toFixed(0)+"% in 24h — most of the move is behind it"});severe++;}
+  else if(h24>=120)flags.push({s:"wr",t:"Up "+h24.toFixed(0)+"% in 24h — late entry"});
+
+  // 5. Rolling over: strong day, weak last six hours.
+  if(h24>50&&h6<-10)flags.push({s:"wr",t:"Turned down "+Math.abs(h6).toFixed(0)+"% in 6h after a strong day"});
+
+  // 6. Market cap far beyond what backs it.
+  var ratio=fdv>0?liq/fdv:0;
+  if(ratio>0&&ratio<0.03){flags.push({s:"bad",t:"Only "+(ratio*100).toFixed(1)+"% of its valuation is backed by liquidity"});severe++;}
+
+  // 7. Churn far above pool size — usually wash trading or a frenzy top.
+  var turn=liq>0?v24/liq:0;
+  if(turn>25){flags.push({s:"wr",t:"Volume is "+turn.toFixed(0)+"x liquidity — abnormal churn"});}
+
+  // 8. Concentration that can end it in one transaction.
+  if(sec&&typeof sec.top10==="number"&&sec.top10>28)
+    flags.push({s:"wr",t:"Top 10 hold "+sec.top10.toFixed(0)+"% — a few wallets can end it"});
+
+  var score=Math.max(0,100-(severe*30)-(flags.filter(function(f){return f.s==="wr";}).length*10));
+  return {flags:flags,severe:severe,score:score,delta:d};
+}
+
+// ===========================================================================
+// HEATING UP  —  the build phase, before the vertical move
+//
+// The idea: compare the token's own recent trading rate against its slower
+// averages. If the last hour is running well above the 6h rate, and the 6h
+// above the 24h rate, activity is compounding rather than spiking. Crucially
+// this REQUIRES that price has not already run — the point is to catch the
+// build, not the top. A token up 400% is disqualified here by design.
+// ===========================================================================
+function heatScore(p){
+  var v1=num(p.volume&&p.volume.h1);
+  var v6=num(p.volume&&p.volume.h6);
+  var v24=num(p.volume&&p.volume.h24);
+  var h1=num(p.priceChange&&p.priceChange.h1);
+  var h6=num(p.priceChange&&p.priceChange.h6);
+  var h24=num(p.priceChange&&p.priceChange.h24);
+  var tx1=(p.txns&&p.txns.h1)||{}, tx24=(p.txns&&p.txns.h24)||{};
+  var b1=num(tx1.buys), s1=num(tx1.sells), b24=num(tx24.buys), s24=num(tx24.sells);
+
+  if(v24<=0)return null;
+
+  // hourly rates at each window
+  var r1=v1, r6=v6/6, r24=v24/24;
+  var accel6 = r6>0 ? r1/r6 : 0;      // last hour vs 6h pace
+  var accel24= r24>0 ? r6/r24 : 0;    // 6h pace vs 24h pace
+
+  // Both legs rising = compounding interest, not a single candle.
+  var stacked = accel6>1.15 && accel24>1.1;
+
+  // Trade count building too (volume alone can be one whale or a wash trade)
+  var tRate24 = (b24+s24)/24;
+  var tAccel = tRate24>0 ? (b1+s1)/tRate24 : 0;
+
+  // Buyers must be leading
+  var flow1 = (b1+s1)>8 ? b1/(b1+s1) : 0.5;
+
+  // Disqualify anything that already ran — this tab is for the build only
+  var alreadyRan = h24>=100 || h6>=60;
+  var overheated = accel6>6;           // vertical spike, not a build
+
+  var score=0;
+  score += Math.min(30, Math.max(0,(accel6-1)*28));
+  score += Math.min(25, Math.max(0,(accel24-1)*30));
+  score += Math.min(20, Math.max(0,(tAccel-1)*22));
+  score += Math.min(15, Math.max(0,(flow1-0.5)*90));
+  // reward a token that's up modestly — moving, but not blown off
+  score += (h24>2&&h24<60) ? 10 : (h24>=60&&h24<100 ? 4 : 0);
+
+  if(alreadyRan) score*=0.25;
+  if(overheated) score*=0.5;
+
+  return {
+    score:Math.round(Math.max(0,Math.min(100,score))),
+    accel6:accel6, accel24:accel24, tAccel:tAccel,
+    flow1:flow1, stacked:stacked, alreadyRan:alreadyRan, overheated:overheated,
+    h24:h24, h6:h6, h1:h1
+  };
+}
+
+// Snapshot history turns a guess into evidence: is volume genuinely higher
+// than when we first saw it, and is liquidity growing rather than leaving?
+function heatConfirmation(p){
+  var hist=snapHistory(p);
+  if(!hist||hist.length<2)return null;
+  var first=hist[0], last=hist[hist.length-1];
+  var mins=(Date.now()-first.t)/60000;
+  if(mins<10)return null;
+  return {
+    minutes:mins, samples:hist.length,
+    volGrowth: first.v24>0 ? ((num(p.volume&&p.volume.h24)-first.v24)/first.v24)*100 : null,
+    liqGrowth: first.liq>0 ? ((num(p.liquidity&&p.liquidity.usd)-first.liq)/first.liq)*100 : null,
+    pxGrowth:  first.px>0  ? ((num(p.priceUsd)-first.px)/first.px)*100 : null
+  };
+}
+
+function heatLabel(hs){
+  if(!hs)return "";
+  if(hs.alreadyRan)return "already moved";
+  if(hs.overheated)return "spiking, not building";
+  if(hs.score>=70)return "building fast";
+  if(hs.score>=50)return "building steadily";
+  if(hs.score>=30)return "early stirrings";
+  return "quiet";
+}
+
+// Social presence, from data DexScreener already returns. This is not
+// sentiment analysis — it reports whether the project has public channels
+// and gives one-tap search. Automated tweet analysis needs the paid X API
+// and a server, neither of which a static site has.
+function socialHTML(p){
+  var sym=(p.baseToken&&p.baseToken.symbol)||"";
+  var addr=(p.baseToken&&p.baseToken.address)||"";
+  var info=p.info||{};
+  var socials=Array.isArray(info.socials)?info.socials:[];
+  var websites=Array.isArray(info.websites)?info.websites:[];
+
+  var links=[];
+  socials.forEach(function(s){
+    if(!s||!s.url)return;
+    var t=(s.type||s.platform||"link").toLowerCase();
+    links.push([t.charAt(0).toUpperCase()+t.slice(1), s.url]);
+  });
+  websites.forEach(function(w){ if(w&&w.url)links.push(["Website",w.url]); });
+
+  var h='<div style="margin-top:14px;border:1px solid var(--line);border-radius:11px;overflow:hidden">'+
+    '<div style="padding:12px 14px;background:var(--raised);font-size:12.5px;text-transform:uppercase;'+
+    'letter-spacing:.09em;color:var(--text2);font-weight:800;display:flex;justify-content:space-between">'+
+    '<span>Social presence</span><span style="color:'+(links.length?"var(--frog)":"var(--dim)")+'">'+
+    (links.length?links.length+" official":"none listed")+'</span></div><div style="padding:13px 14px">';
+
+  if(!links.length)
+    h+='<div style="font-size:14px;color:var(--amber);line-height:1.6">No official links published. '+
+       'Not disqualifying on its own, but real projects normally list somewhere to talk.</div>';
+
+  h+='<div class="links" style="margin-top:'+(links.length?"0":"11px")+'">';
+  links.slice(0,3).forEach(function(L){
+    h+='<a href="'+esc(L[1])+'" target="_blank" rel="noopener">'+esc(L[0])+' \u2197</a>';
+  });
+  h+='</div><div class="links" style="margin-top:9px">'+
+    '<a href="https://x.com/search?q='+encodeURIComponent(addr)+'&f=live" target="_blank" rel="noopener">Search X for CA \u2197</a>'+
+    (sym?'<a href="https://x.com/search?q='+encodeURIComponent("$"+sym)+'&f=live" target="_blank" rel="noopener">Search $'+esc(sym)+' \u2197</a>':'')+
+    '</div>'+
+    '<div style="margin-top:11px;font-size:13.5px;color:var(--dim);line-height:1.6">'+
+    'Searching the <b>contract address</b> is the more useful of the two \u2014 ticker searches are '+
+    'full of unrelated tokens, and anyone genuinely discussing this one will post the CA. '+
+    'Sort by Latest and check whether real accounts are talking or it is all fresh burner accounts.</div>'+
+    '</div></div>';
+  return h;
+}
+
 function copyCA(a,btn){
   function ok(){btn.textContent="Copied";setTimeout(function(){btn.textContent="Copy";},1400);}
   if(navigator.clipboard&&navigator.clipboard.writeText)
@@ -1650,7 +2006,7 @@ function cardHTML(p,isBlocked){
   if(cv&&!isBlocked){
     var col=gradeColor(cv.grade);
     h+='<div class="gradebox"><div class="grade" style="color:'+col+'">'+cv.grade+'</div>'+
-       '<div class="gradelbl">conviction</div>'+
+       '<div class="gradelbl">setup</div>'+
        '<div class="convbar"><i style="width:'+cv.total+'%;background:'+col+'"></i></div></div>';
   }
   h+='</div>';
@@ -1706,7 +2062,7 @@ function cardHTML(p,isBlocked){
     h+='</div>';
     h+=deployerHTML(p,sec);
     if(cv&&!isBlocked){
-      h+='<div class="factors"><div class="hd"><span>Conviction factors</span><span>'+cv.total.toFixed(0)+'/100</span></div>';
+      h+='<div class="factors"><div class="hd"><span>Setup factors</span><span>'+cv.total.toFixed(0)+'/100</span></div>';
       FACTORS.forEach(function(F){
         var val=cv.f[F.k];
         var c2=val>=70?"var(--frog)":val>=45?"var(--amber)":"var(--red)";
@@ -1742,6 +2098,8 @@ function cardHTML(p,isBlocked){
     h+='</div>';
   }
 
+  h+=dumpRiskHTML(p);
+  if(!isBlocked) h+=socialHTML(p);
   if(!isBlocked&&cv&&(g.verdict==="pass"||g.verdict==="caution")) h+=buyPlanHTML(p);
   h+='<div class="ca"><code>'+esc(addr)+'</code><button data-copy="'+esc(addr)+'">Copy</button></div>';
   if(!isBlocked&&cv){
@@ -1935,6 +2293,37 @@ function deployerHTML(p,sec){
   return h;
 }
 
+// Downside panel. Deliberately placed above the buy plan: the reasons this
+// could go to zero should be read before the reasons to buy it.
+function dumpRiskHTML(p){
+  var dr=p._dump; if(!dr||!dr.flags.length)return "";
+  var col=dr.severe>=2?"var(--red)":dr.severe===1?"var(--amber)":
+    dr.flags.some(function(f){return f.s==="wr";})?"var(--amber)":"var(--frog)";
+  var label=dr.severe>=2?"HIGH DUMP RISK":dr.severe===1?"ELEVATED DUMP RISK":
+    dr.flags.some(function(f){return f.s==="wr";})?"SOME DOWNSIDE FLAGS":"NO DOWNSIDE FLAGS";
+
+  var h='<div style="margin-top:14px;border:1.5px solid '+col+';border-radius:11px;overflow:hidden">'+
+    '<div style="padding:12px 14px;background:rgba(255,255,255,.03);font-size:12.5px;'+
+    'text-transform:uppercase;letter-spacing:.09em;font-weight:800;color:'+col+
+    ';display:flex;justify-content:space-between;gap:10px"><span>'+label+'</span>'+
+    (dr.delta?'<span style="font-family:var(--mono);font-size:11.5px;opacity:.8">tracked '+
+      (dr.delta.minutes<90?Math.round(dr.delta.minutes)+"m":Math.round(dr.delta.minutes/60)+"h")+'</span>':
+      '<span style="font-family:var(--mono);font-size:11.5px;opacity:.7">first sighting</span>')+
+    '</div><div style="padding:4px 0">';
+  dr.flags.forEach(function(f){
+    var ic=f.s==="bad"?"\u2715":f.s==="wr"?"!":"\u2713";
+    var c2=f.s==="bad"?"var(--red)":f.s==="wr"?"var(--amber)":"var(--frog)";
+    h+='<div class="chk"><span class="ic" style="color:'+c2+'">'+ic+'</span>'+
+       '<span class="tx" style="color:'+(f.s==="ok"?"var(--text2)":c2)+'">'+esc(f.t)+'</span></div>';
+  });
+  h+='</div>';
+  if(!dr.delta)
+    h+='<div style="padding:11px 14px;font-size:13.5px;color:var(--dim);border-top:1px solid var(--line)">'+
+       'First time seeing this token, so nothing can be compared yet. Scan again in an hour and '+
+       'RibbitPad will tell you whether liquidity is growing or being pulled.</div>';
+  return h+'</div>';
+}
+
 function buyPlanHTML(p){
   var cv=p._cv, econ=p._econ;
   if(!cv||!econ)return "";
@@ -1989,8 +2378,11 @@ function topPicksHTML(list){
   var picks=list.slice(0,3);
   var h='<div class="banner info" style="border-color:var(--frog);background:#0A1A07">'+
     '<b style="color:var(--frog)">\ud83c\udfaf Top picks this scan</b><br><br>'+
-    'Ranked highest by conviction out of '+list.length+' that cleared the security audit. '+
-    'This is where to look first \u2014 not a promise any of them will run.</div>';
+    'Highest setup quality out of '+list.length+' that cleared the audit.<br><br>'+
+    '<b>What the grade means:</b> it measures structure \u2014 liquidity depth, distribution, '+
+    'deployer holdings, buying pressure, room to grow. A high grade means the token is '+
+    '<i>not obviously rigged to fail</i>. It is not a forecast. Well-structured tokens go to '+
+    'zero constantly; that is the normal outcome for microcaps, not a malfunction.</div>';
 
   picks.forEach(function(p,i){
     var cv=p._cv, pm=profileMatch(p);
@@ -2113,6 +2505,69 @@ function scanPane(){
     (S.lastFetch?new Date(S.lastFetch).toLocaleTimeString():"—")+'<br><br>'+
     'Fee figures are estimates and move with congestion. Grades rank measurable qualities, not future price. Nothing here is financial advice.</footer>';
   return h;
+}
+
+function heatPane(){
+  var h='<div class="toolbar"><button class="primary" id="heatBtn">'+
+    (S.heatLoading?"Looking for build-ups\u2026":"\ud83d\udcc8 Find tokens heating up")+'</button></div>'+chainBar();
+
+  h+='<div class="banner info"><b>The build phase, not the spike.</b><br><br>'+
+    'This looks for tokens whose trading is <i>compounding</i> \u2014 the last hour running above '+
+    'the 6-hour pace, and that above the 24-hour pace \u2014 while the price has <b>not</b> already run. '+
+    'Anything up more than 100% in a day is excluded on purpose: the point is to be early, not to '+
+    'chase a candle that already happened.</div>';
+
+  if(S.localBlocked)return h+localFileNotice();
+  if(S.heatErr)return h+'<div class="banner err code">'+esc(S.heatErr)+'</div>';
+  if(S.heatLoading)return h+'<div class="empty"><div class="spinner"></div>Checking build-ups\u2026</div>';
+  if(!S.heat.length&&!S.heatUnverified.length){
+    if(S.heatCoverage)
+      return h+'<div class="empty">Nothing is building right now.<br><br>'+
+        'Scanned '+S.heatCoverage.found+' pairs; none showed compounding activity while still early. '+
+        'That is a normal result \u2014 most of the time the market is either quiet or already moving.</div>';
+    return h+'<div class="empty">Tap <b>Find tokens heating up</b> to look for build-ups.</div>';
+  }
+
+  if(S.heat.length){
+    h+='<div class="banner warn"><b>'+S.heat.length+' building</b>'+
+      (S.heatUnverified.length?', '+S.heatUnverified.length+' unverifiable':'')+
+      '. Strongest build first. Passing here means activity is rising and the audit is clean \u2014 '+
+      'not that the rise continues.</div>';
+    S.heat.forEach(function(p){h+=heatCard(p);});
+  }
+  if(S.heatUnverified.length){
+    h+='<div style="margin:18px 18px 0;padding:15px;border-radius:12px;border:1.5px solid #4A4A4A;background:#141414">'+
+      '<div style="font-size:15px;font-weight:800;color:#DADADA">\u2753 '+S.heatUnverified.length+
+      ' building but unverifiable</div><div style="margin-top:8px;font-size:14px;line-height:1.6;color:var(--text2)">'+
+      'Activity is rising, but no security record exists yet. Unknown, not safe.</div></div>';
+    S.heatUnverified.slice(0,10).forEach(function(p){h+=heatCard(p);});
+  }
+  return h;
+}
+
+function heatCard(p){
+  var hs=p._heat, cf=p._confirm;
+  var col=hs.score>=70?"var(--frog)":hs.score>=50?"#9BE88A":"var(--amber)";
+  var h='<div style="padding:12px 18px 0">'+
+    '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px">'+
+    '<span style="font-family:var(--mono);font-size:13.5px;color:'+col+';font-weight:700">'+
+    '\ud83d\udcc8 '+esc(heatLabel(hs))+'</span>'+
+    '<span style="font-family:var(--mono);font-size:13px;color:var(--dim)">heat '+hs.score+'/100</span></div>'+
+    '<div style="margin-top:6px;font-size:13.5px;color:var(--text2);line-height:1.6">'+
+    'Last hour running <b>'+hs.accel6.toFixed(1)+'x</b> its 6h pace'+
+    (hs.accel24>1?', 6h running <b>'+hs.accel24.toFixed(1)+'x</b> its daily pace':'')+
+    '. Buyers '+(hs.flow1*100).toFixed(0)+'% of trades this hour. Price '+
+    (hs.h24>=0?"+":"")+hs.h24.toFixed(0)+'% today.</div>';
+  if(cf){
+    var lg=cf.liqGrowth, vg=cf.volGrowth;
+    h+='<div style="margin-top:6px;font-size:13.5px;color:'+
+      ((lg!=null&&lg<-10)?"var(--red)":"var(--frog)")+'">'+
+      'Tracked '+(cf.minutes<90?Math.round(cf.minutes)+"m":Math.round(cf.minutes/60)+"h")+': '+
+      (vg!=null?'volume '+(vg>=0?"+":"")+vg.toFixed(0)+'%':'')+
+      (lg!=null?', liquidity '+(lg>=0?"+":"")+lg.toFixed(0)+'%':'')+'</div>';
+  }
+  h+='</div>';
+  return h+cardHTML(p,false);
 }
 
 function freshPane(){
@@ -2688,6 +3143,9 @@ function cfgPane(){
   '<div class="field"><label>Daily loss limit</label><input id="cDayLoss" type="number" inputmode="decimal" value="'+c.dailyLossLimit+'" />'+
   '<div class="hint">Warns you when 24h realised losses pass this. Chasing losses is the most reliable way to turn a bad day into a bad month.</div></div>'+
 
+  '<div class="field"><label>Heat threshold</label><input id="cHeat" type="number" inputmode="decimal" value="'+c.heatThreshold+'" />'+
+  '<div class="hint">Minimum build score for the Heat tab (0\u2013100). Lower shows more, earlier and noisier; higher shows only strong build-ups.</div></div>'+
+
   '<div class="field"><label>New-launch window (hours)</label><div class="row2">'+
   '<input id="cFreshMin" type="number" inputmode="decimal" step="0.5" value="'+c.freshMinAgeH+'" />'+
   '<input id="cFreshMax" type="number" inputmode="decimal" value="'+c.freshMaxAgeH+'" /></div>'+
@@ -2718,6 +3176,8 @@ function render(){
     stakeBar()+
     '<div class="tabs">'+
     '<button data-tab="scan" class="'+(S.tab==="scan"?"on":"")+'">Scan'+(shown?' <span class="n">'+shown+'</span>':'')+'</button>'+
+    '<button data-tab="heat" class="'+(S.tab==="heat"?"on":"")+'">Heat'+
+      (S.heat.length?' <span class="n">'+S.heat.length+'</span>':'')+'</button>'+
     '<button data-tab="fresh" class="'+(S.tab==="fresh"?"on":"")+'">New'+
       ((S.fresh.length+S.freshUnverified.length)?' <span class="n">'+(S.fresh.length+S.freshUnverified.length)+'</span>':'')+'</button>'+
     '<button data-tab="watch" class="'+(S.tab==="watch"?"on":"")+'">Watch'+(S.watch.length?' <span class="n">'+S.watch.length+'</span>':'')+'</button>'+
@@ -2727,6 +3187,7 @@ function render(){
     '<button data-tab="cfg" class="'+(S.tab==="cfg"?"on":"")+'">Set</button>'+
     '</div>'+
     '<div class="pane '+(S.tab==="scan"?"on":"")+'">'+(S.tab==="scan"?scanPane():"")+'</div>'+
+    '<div class="pane '+(S.tab==="heat"?"on":"")+'">'+(S.tab==="heat"?heatPane():"")+'</div>'+
     '<div class="pane '+(S.tab==="fresh"?"on":"")+'">'+(S.tab==="fresh"?freshPane():"")+'</div>'+
     '<div class="pane '+(S.tab==="watch"?"on":"")+'">'+(S.tab==="watch"?watchPane():"")+'</div>'+
     '<div class="pane '+(S.tab==="journal"?"on":"")+'">'+(S.tab==="journal"?journalPane():"")+'</div>'+
@@ -2762,6 +3223,7 @@ function render(){
   var di=document.getElementById("dismissIntro");
   if(di)di.onclick=function(){S.seenIntro=true;S.cfg.seenIntro=true;saveCfg();render();};
   var fb=document.getElementById("freshBtn");if(fb)fb.onclick=runFresh;
+  var hb=document.getElementById("heatBtn");if(hb)hb.onclick=runHeat;
   var sT=document.getElementById("sortToggle");
   if(sT)sT.onclick=function(){
     S.cfg.freshSortBySurge=!(S.cfg.freshSortBySurge!==false);saveCfg();
@@ -2858,6 +3320,7 @@ function render(){
     c.maxOpenPositions=Math.max(1,gv("cMaxPos",c.maxOpenPositions,1));
     c.maxExposureUsd=Math.max(1,gv("cMaxExp",c.maxExposureUsd,1));
     c.dailyLossLimit=Math.max(1,gv("cDayLoss",c.dailyLossLimit,1));
+    c.heatThreshold=Math.max(0,Math.min(100,gv("cHeat",c.heatThreshold,0)));
     c.freshMinAgeH=gv("cFreshMin",c.freshMinAgeH);
     c.freshMaxAgeH=Math.max(1,gv("cFreshMax",c.freshMaxAgeH,1));
     c.freshMinLiq=gv("cFreshLiq",c.freshMinLiq);
