@@ -474,10 +474,10 @@ var S={
     liqMultiple:400,         // require liquidity >= stake * this
     minVol:5000, maxAgeH:336, minAgeH:1,
     maxBuyTax:5, maxSellTax:5, maxTop10:40,
-    strict:true, requireLpLock:true, hideBlocked:false, minGrade:"C",
+    strict:true, requireLpLock:true, hideBlocked:false, minGrade:"B-",
     auditLimit:100,        // how many candidates to deep-audit per scan
     freshMaxAgeH:48, freshMinAgeH:0.5, freshMinLiq:5000, freshSortBySurge:true,
-    maxOpenPositions:5, maxExposureUsd:50, dailyLossLimit:20, maxCreatorPct:10, seenIntro:false, heatThreshold:35
+    maxOpenPositions:5, maxExposureUsd:50, dailyLossLimit:20, maxCreatorPct:10, seenIntro:false, heatThreshold:35, liveEnabled:true, liveIntervalSec:5
   },
   coverage:null,           // {found, chains, screened, audited} for transparency
   fresh:[], freshBlocked:[], freshUnverified:[], freshLoading:false, freshErr:null, freshCoverage:null,
@@ -485,6 +485,7 @@ var S={
   watch:[], watchData:{}, watchLoading:false, watchErr:null, watchInput:"",
   wallets:[], walletInput:"",
   trades:[], tradesLoading:false, journalNote:null, expanded:{}, seenIntro:false,
+  showLearn:false, learnOpen:{},
   watching:false, watchTimer:null, alerts:[], notifOk:false
 };
 
@@ -999,19 +1000,43 @@ function conviction(p,sec,econ){
 }
 
 function gradeOf(s){
-  if(s>=88)return "A+";if(s>=80)return "A";if(s>=73)return "B+";
-  if(s>=66)return "B";if(s>=58)return "C+";if(s>=50)return "C";
-  if(s>=40)return "D";return "F";
+  if(s>=90)return "A+"; if(s>=84)return "A";  if(s>=78)return "A-";
+  if(s>=72)return "B+"; if(s>=66)return "B";  if(s>=60)return "B-";
+  if(s>=54)return "C+"; if(s>=48)return "C";  if(s>=42)return "C-";
+  if(s>=34)return "D";  return "F";
 }
 function gradeColor(g){
-  if(g==="A+"||g==="A")return "var(--frog)";
-  if(g==="B+"||g==="B")return "#9BE88A";
-  if(g==="C+"||g==="C")return "var(--amber)";
+  if(g==="A+"||g==="A"||g==="A-")return "var(--frog)";
+  if(g==="B+"||g==="B"||g==="B-")return "#9BE88A";
+  if(g==="C+"||g==="C"||g==="C-")return "var(--amber)";
   if(g==="D")return "#FF9A6B";
   return "var(--red)";
 }
-var GRADE_ORDER=["F","D","C","C+","B","B+","A","A+"];
+var GRADE_ORDER=["F","D","C-","C","C+","B-","B","B+","A-","A","A+"];
 function gradeAtLeast(g,min){return GRADE_ORDER.indexOf(g)>=GRADE_ORDER.indexOf(min);}
+
+// Every list in the app goes through this: drop anything below the minimum
+// grade, then sort strictly best-first. Used by Scan, Heat, New and Watch so
+// the ordering rule is identical everywhere rather than per-tab.
+function rankAndFilter(list){
+  var out=(list||[]).filter(function(p){
+    return p&&p._cv&&gradeAtLeast(p._cv.grade,S.cfg.minGrade);
+  });
+  out.sort(function(a,b){
+    var d=b._cv.total-a._cv.total;
+    if(Math.abs(d)>0.001)return d;
+    // tie-break on build strength, then liquidity
+    var ha=(a._heat&&a._heat.score)||0, hb=(b._heat&&b._heat.score)||0;
+    if(ha!==hb)return hb-ha;
+    return num(b.liquidity&&b.liquidity.usd)-num(a.liquidity&&a.liquidity.usd);
+  });
+  return out;
+}
+function belowThreshold(list){
+  return (list||[]).filter(function(p){
+    return p&&p._cv&&!gradeAtLeast(p._cv.grade,S.cfg.minGrade);
+  }).length;
+}
 
 function thesis(cv,econ){
   var f=cv.f,ups=[],downs=[];
@@ -1980,6 +2005,180 @@ function socialHTML(p){
   return h;
 }
 
+// ===========================================================================
+// LIVE PRICE FEED
+//
+// Every visible token is polled on a timer. Two things make this safe and
+// smooth rather than rate-limit suicide:
+//   1. Addresses are BATCHED — DexScreener takes up to 30 per request, so a
+//      screen full of tokens costs one call per chain, not one per token.
+//   2. Updates patch the DOM directly instead of re-rendering. A full render
+//      every 5s would destroy scroll position and any half-typed input.
+// Polling pauses when the tab is hidden so it doesn't drain the battery.
+// ===========================================================================
+var LIVE={timer:null, running:false, prices:{}, lastTick:0, inflight:false};
+
+function liveKey(chain,addr){return (chain||"")+":"+String(addr||"").toLowerCase();}
+
+// Everything currently on screen that has a price worth tracking.
+function visibleTokens(){
+  var out=[],seen={};
+  function add(p){
+    if(!p||!p.baseToken||!p.baseToken.address)return;
+    var k=liveKey(p.chainId,p.baseToken.address);
+    if(seen[k])return; seen[k]=1;
+    out.push({chain:p.chainId,addr:p.baseToken.address,key:k});
+  }
+  if(S.tab==="scan"){rankAndFilter(S.passed).forEach(add);rankAndFilter(S.unverified).slice(0,10).forEach(add);}
+  else if(S.tab==="heat"){rankAndFilter(S.heat).forEach(add);rankAndFilter(S.heatUnverified).slice(0,10).forEach(add);}
+  else if(S.tab==="fresh"){rankAndFilter(S.fresh).forEach(add);rankAndFilter(S.freshUnverified).slice(0,15).forEach(add);}
+  else if(S.tab==="watch"){S.watch.forEach(function(a){var d=S.watchData[a];if(d&&!d._err)add(d);});}
+  else if(S.tab==="lookup"){if(S.lookup)add(S.lookup);}
+  else if(S.tab==="journal"){
+    S.trades.filter(function(t){return t.status==="open";}).forEach(function(t){
+      var k=liveKey(t.chain,t.addr);
+      if(seen[k]||!t.addr)return; seen[k]=1;
+      out.push({chain:t.chain,addr:t.addr,key:k});
+    });
+  }
+  return out.slice(0,60);   // hard ceiling so a huge list can't hammer the API
+}
+
+function liveTick(){
+  if(LIVE.inflight)return;
+  var toks=visibleTokens();
+  if(!toks.length)return;
+
+  // group by chain, 30 per request
+  var byChain={};
+  toks.forEach(function(t){(byChain[t.chain]=byChain[t.chain]||[]).push(t.addr);});
+  var calls=[];
+  Object.keys(byChain).forEach(function(ch){
+    var a=byChain[ch];
+    for(var i=0;i<a.length;i+=30)
+      calls.push(fetchJSON(DS+"/latest/dex/tokens/"+a.slice(i,i+30).join(","),8000)
+        .catch(function(){return {pairs:[]};}));
+  });
+  if(!calls.length)return;
+
+  LIVE.inflight=true;
+  Promise.all(calls).then(function(res){
+    var best={};
+    res.forEach(function(d){
+      ((d&&d.pairs)||[]).forEach(function(p){
+        var k=liveKey(p.chainId,(p.baseToken&&p.baseToken.address)||"");
+        var liq=num(p.liquidity&&p.liquidity.usd);
+        if(!best[k]||liq>num(best[k].liquidity&&best[k].liquidity.usd))best[k]=p;
+      });
+    });
+    Object.keys(best).forEach(function(k){
+      var p=best[k];
+      var prev=LIVE.prices[k];
+      var next={
+        px:num(p.priceUsd),
+        m5:num(p.priceChange&&p.priceChange.m5),
+        h1:num(p.priceChange&&p.priceChange.h1),
+        h6:num(p.priceChange&&p.priceChange.h6),
+        h24:num(p.priceChange&&p.priceChange.h24),
+        liq:num(p.liquidity&&p.liquidity.usd),
+        v24:num(p.volume&&p.volume.h24),
+        at:Date.now(),
+        dir: prev&&prev.px ? (num(p.priceUsd)>prev.px?1:(num(p.priceUsd)<prev.px?-1:0)) : 0
+      };
+      LIVE.prices[k]=next;
+      // keep the underlying objects fresh so scoring/alerts use live numbers
+      syncLive(k,next);
+    });
+    LIVE.lastTick=Date.now();
+    paintLive();
+  }).catch(function(){}).then(function(){LIVE.inflight=false;});
+}
+
+// Push live values back into the stored token objects and open trades.
+function syncLive(key,v){
+  function upd(p){
+    if(!p||!p.baseToken)return;
+    if(liveKey(p.chainId,p.baseToken.address)!==key)return;
+    p.priceUsd=String(v.px);
+    p.priceChange=p.priceChange||{};
+    p.priceChange.m5=v.m5;p.priceChange.h1=v.h1;p.priceChange.h6=v.h6;p.priceChange.h24=v.h24;
+    p.liquidity=p.liquidity||{};p.liquidity.usd=v.liq;
+  }
+  [S.passed,S.unverified,S.heat,S.heatUnverified,S.fresh,S.freshUnverified].forEach(function(arr){
+    (arr||[]).forEach(upd);
+  });
+  Object.keys(S.watchData).forEach(function(a){upd(S.watchData[a]);});
+  if(S.lookup)upd(S.lookup);
+  S.trades.forEach(function(t){
+    if(t.status==="open"&&liveKey(t.chain,t.addr)===key){t.live=v.px;t.liveAt=v.at;}
+  });
+}
+
+// Patch only the price nodes. No re-render, so scroll and inputs survive.
+function paintLive(){
+  var nodes=document.querySelectorAll?document.querySelectorAll("[data-live]"):[];
+  Array.prototype.forEach.call(nodes,function(el){
+    var k=el.getAttribute("data-live");
+    var f=el.getAttribute("data-livefield")||"px";
+    var v=LIVE.prices[k];
+    if(!v)return;
+    var txt, col=null;
+    if(f==="px"){ txt=px(v.px); col=v.dir>0?"var(--frog)":v.dir<0?"var(--red)":null; }
+    else if(f==="liq"){ txt=compact(v.liq); }
+    else { var n2=v[f]; if(n2==null)return;
+      txt=(n2>=0?"+":"")+n2.toFixed(1)+"%"; col=n2>=0?"var(--frog)":"var(--red)"; }
+    if(el.textContent!==txt){
+      el.textContent=txt;
+      if(col)el.style.color=col;
+      // brief flash so a change is noticeable without being distracting
+      el.style.transition="none";
+      el.style.background=v.dir>0?"rgba(110,232,90,.22)":v.dir<0?"rgba(255,107,122,.22)":"transparent";
+      setTimeout(function(){el.style.transition="background .8s";el.style.background="transparent";},40);
+    }
+  });
+  var stamp=document.getElementById("liveStamp");
+  if(stamp)stamp.textContent=LIVE.lastTick?new Date(LIVE.lastTick).toLocaleTimeString():"—";
+}
+
+function startLive(){
+  if(LIVE.running||IS_LOCAL_FILE)return;
+  LIVE.running=true;
+  liveTick();
+  LIVE.timer=setInterval(function(){
+    if(typeof document!=="undefined"&&document.hidden)return;   // pause off-screen
+    liveTick();
+  },Math.max(3,S.cfg.liveIntervalSec)*1000);
+}
+function stopLive(){
+  LIVE.running=false;
+  if(LIVE.timer)clearInterval(LIVE.timer);
+  LIVE.timer=null;
+}
+function restartLive(){stopLive();if(S.cfg.liveEnabled)startLive();}
+
+// Price + timeframe chips, wired to the live feed by data attributes.
+function livePriceHTML(p){
+  var k=liveKey(p.chainId,(p.baseToken&&p.baseToken.address)||"");
+  var pc=p.priceChange||{};
+  function chip(label,field,val){
+    var v=num(val);
+    return '<div style="flex:1;min-width:0;text-align:center;padding:7px 4px;border-radius:8px;'+
+      'background:var(--panel);border:1px solid var(--line)">'+
+      '<div style="font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em">'+label+'</div>'+
+      '<div class="mono" data-live="'+k+'" data-livefield="'+field+'" style="font-size:14px;font-weight:700;'+
+      'color:'+(v>=0?"var(--frog)":"var(--red)")+';margin-top:2px">'+(v>=0?"+":"")+v.toFixed(1)+'%</div></div>';
+  }
+  return '<div style="margin-top:12px">'+
+    '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px">'+
+    '<span class="mono" data-live="'+k+'" data-livefield="px" style="font-size:20px;font-weight:800;'+
+    'padding:2px 5px;border-radius:6px">'+px(num(p.priceUsd))+'</span>'+
+    '<span style="font-size:11.5px;color:var(--dim);font-family:var(--mono)">'+
+    (S.cfg.liveEnabled?'\u25cf live':'paused')+'</span></div>'+
+    '<div style="display:flex;gap:6px;margin-top:8px">'+
+      chip("5m","m5",pc.m5)+chip("1h","h1",pc.h1)+chip("6h","h6",pc.h6)+chip("24h","h24",pc.h24)+
+    '</div></div>';
+}
+
 function copyCA(a,btn){
   function ok(){btn.textContent="Copied";setTimeout(function(){btn.textContent="Copy";},1400);}
   if(navigator.clipboard&&navigator.clipboard.writeText)
@@ -2075,11 +2274,11 @@ function cardHTML(p,isBlocked){
   }
 
   if(!isBlocked){
-    var ch24=num(p.priceChange&&p.priceChange.h24);
+    h+=livePriceHTML(p);
+    var lk=liveKey(p.chainId,addr);
     h+='<div class="grid">'+
-      '<div class="cell"><div class="k">Price</div><div class="v">'+px(price)+'</div></div>'+
-      '<div class="cell"><div class="k">24h</div><div class="v '+(ch24>=0?"up":"down")+'">'+(ch24>=0?"+":"")+ch24.toFixed(1)+'%</div></div>'+
-      '<div class="cell"><div class="k">Liquidity</div><div class="v">'+compact(num(p.liquidity&&p.liquidity.usd))+'</div></div>'+
+      '<div class="cell"><div class="k">Liquidity</div><div class="v" data-live="'+lk+'" data-livefield="liq">'+
+        compact(num(p.liquidity&&p.liquidity.usd))+'</div></div>'+
       '<div class="cell"><div class="k">FDV</div><div class="v">'+compact(num(p.fdv||p.marketCap))+'</div></div>'+
       '</div>';
 
@@ -2457,8 +2656,8 @@ function scanPane(){
   if(!S.passed.length&&!S.blocked.length&&!S.unverified.length)
     return h+'<div class="empty">Pick your stake above, choose a chain, and tap <b>Scan all chains</b>.</div>';
 
-  var shown=S.passed.filter(function(p){return gradeAtLeast(p._cv.grade,S.cfg.minGrade);});
-  var hidden=S.passed.length-shown.length;
+  var shown=rankAndFilter(S.passed);
+  var hidden=belowThreshold(S.passed);
 
   if(S.coverage){
     var cv=S.coverage;
@@ -2491,7 +2690,7 @@ function scanPane(){
       '<div style="font-size:15px;font-weight:800;color:#DADADA">\u2753 '+S.unverified.length+
       ' unverifiable</div><div style="margin-top:8px;font-size:14px;line-height:1.6;color:var(--text2)">'+
       'No security record exists for these yet. Unknown, not safe.</div></div>';
-    S.unverified.slice(0,10).forEach(function(p){h+=cardHTML(p,false);});
+    rankAndFilter(S.unverified).slice(0,10).forEach(function(p){h+=cardHTML(p,false);});
   }
 
   if(S.blocked.length&&!S.cfg.hideBlocked){
@@ -2520,7 +2719,7 @@ function heatPane(){
   if(S.localBlocked)return h+localFileNotice();
   if(S.heatErr)return h+'<div class="banner err code">'+esc(S.heatErr)+'</div>';
   if(S.heatLoading)return h+'<div class="empty"><div class="spinner"></div>Checking build-ups\u2026</div>';
-  if(!S.heat.length&&!S.heatUnverified.length){
+  if(!rankAndFilter(S.heat).length&&!rankAndFilter(S.heatUnverified).length){
     if(S.heatCoverage)
       return h+'<div class="empty">Nothing is building right now.<br><br>'+
         'Scanned '+S.heatCoverage.found+' pairs; none showed compounding activity while still early. '+
@@ -2528,19 +2727,21 @@ function heatPane(){
     return h+'<div class="empty">Tap <b>Find tokens heating up</b> to look for build-ups.</div>';
   }
 
-  if(S.heat.length){
-    h+='<div class="banner warn"><b>'+S.heat.length+' building</b>'+
+  var heatShown=rankAndFilter(S.heat), heatHidden=belowThreshold(S.heat);
+  if(heatShown.length){
+    h+='<div class="banner warn"><b>'+heatShown.length+' building at '+S.cfg.minGrade+'+</b>'+
+      (heatHidden?', '+heatHidden+' below your grade floor':'')+
       (S.heatUnverified.length?', '+S.heatUnverified.length+' unverifiable':'')+
       '. Strongest build first. Passing here means activity is rising and the audit is clean \u2014 '+
       'not that the rise continues.</div>';
-    S.heat.forEach(function(p){h+=heatCard(p);});
+    rankAndFilter(S.heat).forEach(function(p){h+=heatCard(p);});
   }
   if(S.heatUnverified.length){
     h+='<div style="margin:18px 18px 0;padding:15px;border-radius:12px;border:1.5px solid #4A4A4A;background:#141414">'+
       '<div style="font-size:15px;font-weight:800;color:#DADADA">\u2753 '+S.heatUnverified.length+
       ' building but unverifiable</div><div style="margin-top:8px;font-size:14px;line-height:1.6;color:var(--text2)">'+
       'Activity is rising, but no security record exists yet. Unknown, not safe.</div></div>';
-    S.heatUnverified.slice(0,10).forEach(function(p){h+=heatCard(p);});
+    rankAndFilter(S.heatUnverified).slice(0,10).forEach(function(p){h+=heatCard(p);});
   }
   return h;
 }
@@ -2590,14 +2791,16 @@ function freshPane(){
   if(!S.fresh.length&&!S.freshBlocked.length&&!S.freshUnverified.length)
     return h+'<div class="empty">Tap <b>Find new launches</b> to see pairs created in the last '+S.cfg.freshMaxAgeH+' hours.</div>';
 
-  if(!S.fresh.length&&!S.freshUnverified.length&&!S.freshBlocked.length)
+  if(!rankAndFilter(S.fresh).length&&!rankAndFilter(S.freshUnverified).length&&!S.freshBlocked.length)
     return h+'<div class="empty">Nothing matched. Try widening the age window or lowering the minimum liquidity in Settings.</div>';
 
-  if(S.fresh.length){
-    h+='<div class="banner info"><b>'+S.fresh.length+' new launches cleared the full audit</b>'+
+  var freshShown=rankAndFilter(S.fresh), freshHidden=belowThreshold(S.fresh);
+  if(freshShown.length){
+    h+='<div class="banner info"><b>'+freshShown.length+' new launches at '+S.cfg.minGrade+'+</b>'+
+      (freshHidden?', '+freshHidden+' below your grade floor':'')+
       (S.freshUnverified.length?', '+S.freshUnverified.length+' unverifiable':'')+
       (S.freshBlocked.length?', '+S.freshBlocked.length+' failed':'')+'.</div>';
-    S.fresh.forEach(function(p){
+    rankAndFilter(S.fresh).forEach(function(p){
       var age=ageH(p.pairCreatedAt);
       var sg=p._surge||0;
       var sgTxt=sg>=1.5?' \u00b7 \ud83d\udd25 volume '+sg.toFixed(1)+'x its daily average this hour'
@@ -2625,7 +2828,7 @@ function freshPane(){
       'the majority of rugs \u2014 both happen.<br><br>'+
       '<b style="color:var(--text)">If you touch these, assume you can lose all of it.</b> Open the chart and '+
       'the deployer links on each before doing anything.</div></div>';
-    S.freshUnverified.slice(0,15).forEach(function(p){
+    rankAndFilter(S.freshUnverified).slice(0,15).forEach(function(p){
       var age=ageH(p.pairCreatedAt);
       var sg=p._surge||0;
       h+='<div style="padding:10px 18px 0;font-family:var(--mono);font-size:13.5px;color:var(--dim)">\u23f1 '+
@@ -2654,12 +2857,21 @@ function watchPane(){
   if(!S.watch.length){
     h+='<div class="empty">Nothing tracked yet.<br><br>When you see a token mentioned anywhere \u2014 a group chat, a video, a friend \u2014 paste the address here to audit and grade it, then keep an eye on it.</div>';
   } else {
+    // Ranked best-first like every other list; unloaded/errored entries last.
+    var loaded=[],pending=[];
     S.watch.forEach(function(a){
       var d=S.watchData[a];
-      if(!d){h+='<div class="card"><div class="mono" style="font-size:13px;color:var(--dim);word-break:break-all">'+esc(a)+'</div>'+
+      if(d&&!d._err&&d._cv)loaded.push({addr:a,d:d}); else pending.push({addr:a,d:d});
+    });
+    loaded.sort(function(x,y){return y.d._cv.total-x.d._cv.total;});
+    loaded.concat(pending).forEach(function(item){
+      var a=item.addr,d=item.d;
+      if(!d){h+='<div class="card"><div class="ca"><code>'+esc(a)+'</code>'+
+        '<button data-copy="'+esc(a)+'">Copy</button></div>'+
         '<div style="margin-top:10px;color:var(--dim);font-size:14px">Not loaded yet \u2014 tap Refresh all.</div>'+
         '<div class="toolbar" style="padding:12px 0 0;border:none"><button data-unwatch="'+esc(a)+'">Remove</button></div></div>';return;}
-      if(d._err){h+='<div class="card"><div class="mono" style="font-size:13px;word-break:break-all">'+esc(a)+'</div>'+
+      if(d._err){h+='<div class="card"><div class="ca"><code>'+esc(a)+'</code>'+
+        '<button data-copy="'+esc(a)+'">Copy</button></div>'+
         '<div style="margin-top:10px;color:var(--red);font-size:14px">'+esc(d._err)+'</div>'+
         '<div class="toolbar" style="padding:12px 0 0;border:none"><button data-unwatch="'+esc(a)+'">Remove</button></div></div>';return;}
       h+=cardHTML(d,d._gate.verdict==="block");
@@ -2720,17 +2932,17 @@ function journalPane(){
     steps.forEach(function(m,i){if(mult>=m)hitIdx=i;});
 
     if(t.live<=stop){
-      actions.push({u:0,sym:t.sym,act:"SELL ALL",price:t.live,
+      actions.push({u:0,sym:t.sym,addr:t.addr,act:"SELL ALL",price:t.live,
         why:"past your "+t.stopPct+"% stop \u2014 worth "+usd(value)+" now",col:"var(--red)"});
     } else if(hitIdx>=0){
       var sp=hitIdx===0?50:25;
-      actions.push({u:1,sym:t.sym,act:"SELL "+sp+"%",price:t.live,
+      actions.push({u:1,sym:t.sym,addr:t.addr,act:"SELL "+sp+"%",price:t.live,
         why:"hit "+steps[hitIdx]+"x \u2014 takes "+usd(value*sp/100)+" off the table",col:"var(--frog)"});
     } else if(pct<=-(t.stopPct*0.7)){
-      actions.push({u:2,sym:t.sym,act:"WATCH CLOSELY",price:t.live,
+      actions.push({u:2,sym:t.sym,addr:t.addr,act:"WATCH CLOSELY",price:t.live,
         why:pct.toFixed(0)+"%, stop at "+px(stop),col:"var(--amber)"});
     } else {
-      actions.push({u:3,sym:t.sym,act:"HOLD",price:t.live,
+      actions.push({u:3,sym:t.sym,addr:t.addr,act:"HOLD",price:t.live,
         why:(pct>=0?"+":"")+pct.toFixed(0)+"% \u2014 next target "+
           (steps.filter(function(m){return mult<m;})[0]||"\u2014")+"x at "+
           px(t.entry*(steps.filter(function(m){return mult<m;})[0]||1)),col:"var(--dim)"});
@@ -2750,7 +2962,10 @@ function journalPane(){
         '<div style="display:flex;justify-content:space-between;gap:12px;align-items:baseline">'+
         '<span style="font-weight:800;font-size:16px;color:'+a.col+'">'+esc(a.act)+' '+esc(a.sym)+'</span>'+
         '<span class="mono" style="font-size:14px">'+px(a.price)+'</span></div>'+
-        '<div style="font-size:13.5px;color:var(--dim);margin-top:4px">'+esc(a.why)+'</div></div>';
+        '<div style="font-size:13.5px;color:var(--dim);margin-top:4px">'+esc(a.why)+'</div>'+
+        (a.addr?'<div class="ca" style="margin-top:9px"><code>'+esc(a.addr)+'</code>'+
+          '<button data-copy="'+esc(a.addr)+'">Copy</button></div>':'')+
+        '</div>';
     });
     h+='</div>';
   }
@@ -2825,7 +3040,7 @@ function journalPane(){
     var gk=Object.keys(st.byGrade);
     if(gk.length>1){
       h+='<div class="factors" style="margin:0 18px"><div class="hd"><span>Results by grade</span><span>which grades work for you</span></div>';
-      ["A+","A","B+","B","C+","C","D","F"].forEach(function(g){
+      ["A+","A","A-","B+","B","B-","C+","C","C-","D","F"].forEach(function(g){
         if(!st.byGrade[g])return;
         var d=st.byGrade[g],c=d.pnl>=0?"var(--frog)":"var(--red)";
         h+='<div class="fac"><span class="fl">Grade '+g+'</span>'+
@@ -2857,10 +3072,79 @@ function journalPane(){
     }
     h+='</div>';
 
+    var lk2=liveKey(t.chain,t.addr);
+
+    // Live comparison of what you paid against what it's worth now. This is
+    // the number that actually matters while a position is open, so it gets
+    // its own block rather than being buried in a row.
+    if(open&&t.entry>0){
+      var lp=t.live||0;
+      var chg=lp?((lp-t.entry)/t.entry)*100:null;
+      var valNow=lp?t.size*(lp/t.entry):null;
+      var unreal=valNow!=null?valNow-t.size:null;
+      var stopP=t.entry*(1-t.stopPct/100);
+      var toStop=lp?((lp-stopP)/lp)*100:null;
+      var steps=t.tps.slice().sort(function(a,b){return a-b;});
+      var nextT=steps.filter(function(m){return lp/t.entry<m;})[0];
+      var toTarget=(lp&&nextT)?((t.entry*nextT-lp)/lp)*100:null;
+      var col=chg==null?"var(--dim)":chg>=0?"var(--frog)":"var(--red)";
+
+      h+='<div style="margin-top:12px;border:1.5px solid '+col+';border-radius:11px;overflow:hidden">'+
+        '<div style="padding:11px 14px;background:rgba(255,255,255,.03);font-size:12px;'+
+        'text-transform:uppercase;letter-spacing:.09em;font-weight:800;color:'+col+
+        ';display:flex;justify-content:space-between"><span>Your position now</span>'+
+        '<span style="font-family:var(--mono);font-size:11.5px;opacity:.8">'+
+        (S.cfg.liveEnabled?"\u25cf live":"paused")+'</span></div>'+
+        '<div style="padding:14px">'+
+        '<div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px">'+
+        '<span class="mono" style="font-size:15px;color:var(--dim)">'+px(t.entry)+'</span>'+
+        '<span style="color:var(--dim);font-size:15px">\u2192</span>'+
+        '<span class="mono" data-live="'+lk2+'" data-livefield="px" style="font-size:19px;font-weight:800;'+
+        'padding:2px 5px;border-radius:6px">'+(lp?px(lp):"\u2014")+'</span>'+
+        '<span class="mono" style="font-size:19px;font-weight:800;color:'+col+'">'+
+        (chg==null?"\u2014":(chg>=0?"+":"")+chg.toFixed(1)+"%")+'</span></div>'+
+
+        '<div style="display:flex;gap:8px;margin-top:12px">'+
+        '<div style="flex:1;padding:9px;border-radius:8px;background:var(--panel);border:1px solid var(--line)">'+
+          '<div style="font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">You put in</div>'+
+          '<div class="mono" style="font-size:15px;font-weight:700;margin-top:3px">'+usd(t.size)+'</div></div>'+
+        '<div style="flex:1;padding:9px;border-radius:8px;background:var(--panel);border:1px solid var(--line)">'+
+          '<div style="font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">Worth now</div>'+
+          '<div class="mono" style="font-size:15px;font-weight:700;margin-top:3px;color:'+col+'">'+
+          (valNow!=null?usd(valNow):"\u2014")+'</div></div>'+
+        '<div style="flex:1;padding:9px;border-radius:8px;background:var(--panel);border:1px solid var(--line)">'+
+          '<div style="font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">Up/down</div>'+
+          '<div class="mono" style="font-size:15px;font-weight:700;margin-top:3px;color:'+col+'">'+
+          (unreal!=null?(unreal>=0?"+":"")+usd(unreal):"\u2014")+'</div></div>'+
+        '</div>';
+
+      if(lp){
+        h+='<div style="margin-top:12px;font-size:13.5px;line-height:1.7;color:var(--text2)">'+
+          (toStop!=null?'Your stop at '+px(stopP)+' is <b style="color:var(--red)">'+
+            Math.abs(toStop).toFixed(0)+'% below</b> here.':'')+
+          (toTarget!=null?'<br>Next target '+nextT+'x at '+px(t.entry*nextT)+' is <b style="color:var(--frog)">'+
+            toTarget.toFixed(0)+'% above</b> here.':'<br>Past every target you set.')+
+          '</div>';
+        if(unreal!=null&&valNow!=null&&t.costs){
+          var netIfSold=unreal-(t.costs/2);
+          h+='<div style="margin-top:9px;font-size:13px;color:var(--dim);line-height:1.6">'+
+            'Sell right now and you\u2019d keep about <b style="color:'+
+            (netIfSold>=0?"var(--frog)":"var(--red)")+'">'+(netIfSold>=0?"+":"")+usd(netIfSold)+
+            '</b> after the remaining exit fee.</div>';
+        }
+      } else {
+        h+='<div style="margin-top:10px;font-size:13.5px;color:var(--dim)">'+
+          'Waiting for a live price. Make sure the live feed is on.</div>';
+      }
+      h+='</div></div>';
+    }
+
     h+='<div class="levels"><div class="hd">'+(open?"Open position":"Closed")+'</div>'+
       '<div class="lvl"><span class="lbl">Entry</span><span>'+px(t.entry)+'</span></div>';
     if(open){
-      h+='<div class="lvl"><span class="lbl">Now</span><span>'+(live?px(live):"tap Update prices")+'</span></div>'+
+      h+='<div class="lvl"><span class="lbl">Now</span><span class="mono" data-live="'+lk2+
+        '" data-livefield="px" style="padding:1px 5px;border-radius:5px">'+
+        (live?px(live):"—")+'</span></div>'+
         '<div class="lvl sl"><span class="lbl">Your stop \u2212'+t.stopPct+'%</span><span class="down">'+px(stopPrice)+'</span></div>';
       t.tps.forEach(function(m){
         h+='<div class="lvl tp"><span class="lbl">Target '+m+'x</span><span class="up">'+px(t.entry*m)+'</span></div>';
@@ -2873,7 +3157,33 @@ function journalPane(){
     }
     h+='</div>';
 
+    // Contract address, copyable — you need it to find the position again
+    // in your wallet or on a chart, and typing it out is error-prone.
+    h+='<div class="ca"><code>'+esc(t.addr||"(no address saved)")+'</code>'+
+       (t.addr?'<button data-copy="'+esc(t.addr)+'">Copy</button>':'')+'</div>';
+    if(t.addr){
+      var chartUrl=t.chain==="solana"
+        ? "https://dexscreener.com/solana/"+encodeURIComponent(t.addr)
+        : "https://dexscreener.com/"+encodeURIComponent(t.chain||"ethereum")+"/"+encodeURIComponent(t.addr);
+      h+='<div class="links"><a href="'+esc(chartUrl)+'" target="_blank" rel="noopener">Chart \u2197</a>'+
+         '<a href="https://x.com/search?q='+encodeURIComponent(t.addr)+'&f=live" target="_blank" rel="noopener">Search X \u2197</a></div>';
+    }
+
     if(open){
+      // What the app recorded is the scan price; what you actually paid may
+      // differ after slippage. Correcting it fixes every downstream number.
+      h+='<div class="field" style="padding:14px 0 0"><label>What you actually paid</label>'+
+        '<div class="row2">'+
+        '<input class="entryIn" data-entry="'+esc(t.id)+'" inputmode="decimal" '+
+          'placeholder="entry price" value="'+esc(String(t.entry))+'" />'+
+        '<input class="sizeIn" data-size="'+esc(t.id)+'" inputmode="decimal" '+
+          'placeholder="amount $" value="'+esc(String(t.size))+'" />'+
+        '</div>'+
+        '<div class="hint">Entry price and dollar amount. Everything \u2014 stop, targets, P&amp;L \u2014 '+
+        'recalculates from these.</div>'+
+        '<div class="toolbar" style="padding:11px 0 0;border:none">'+
+        '<button data-saveentry="'+esc(t.id)+'">Save entry</button></div></div>';
+
       h+='<div class="field" style="padding:14px 0 0"><label>Sold it? Enter your exit price</label>'+
         '<input class="exitIn" data-exit="'+esc(t.id)+'" inputmode="decimal" placeholder="e.g. 0.00084" /></div>'+
         '<div class="toolbar" style="padding:12px 0 0;border:none">'+
@@ -3083,17 +3393,60 @@ function lookupPane(){
   return h+'<div class="empty">Paste a contract address before you buy — honeypot audit, grade, real cost, and your exact levels.</div>'+huntsHTML();
 }
 
+var LEARN=[
+  {q:"Liquidity", a:"The pool of money sitting on the exchange that lets people actually trade the token. If a pool holds $50,000, that is roughly what is available to buy from and sell into.<br><br><b>Why it matters most:</b> you can only get out through the liquidity. A token can show a wonderful price and still be impossible to sell if the pool is tiny. Liquidity leaving the pool is the clearest sign of a rug in progress."},
+  {q:"FDV / Market cap", a:"FDV is the token price multiplied by its <i>entire</i> supply \u2014 what the whole project would be worth at today's price. Market cap counts only tokens actually in circulation.<br><br><b>The trap:</b> a token can post a $50M FDV backed by $30,000 of real liquidity. The valuation is arithmetic, not money that exists. Always read FDV alongside liquidity \u2014 RibbitPad blocks anything under 3% backed."},
+  {q:"Slippage", a:"The gap between the price you see and the price you actually get. Buying moves the price against you; the smaller the pool, the more it moves.<br><br>At your size this is usually tiny, but it is charged twice \u2014 once going in, once coming out. RibbitPad estimates the full round trip so nothing surprises you."},
+  {q:"Honeypot", a:"A contract deliberately written so you can buy but cannot sell. Your wallet shows a balance and gains you can never realise.<br><br>GoPlus simulates a sell before you ever see the token, and anything flagged is blocked outright. This is the check that saves the most money, and no setting turns it off."},
+  {q:"Buy / sell tax", a:"A cut the contract takes on every trade. A 5% sell tax means selling $100 returns $95.<br><br>Small taxes are normal. Anything above about 10% is a serious warning, and taxes the owner can change later are worse \u2014 they can be raised to 99% the moment you try to exit."},
+  {q:"Mint authority (Solana)", a:"Permission to create more tokens out of nothing. If still active, the deployer can print supply and crush the price whenever they choose.<br><br>Legitimate projects revoke it after launch. RibbitPad blocks anything where it is still live \u2014 no exceptions."},
+  {q:"Freeze authority (Solana)", a:"Permission to freeze token accounts, meaning your wallet can be blocked from selling. Revoked by honest projects, and an unconditional block here."},
+  {q:"Liquidity lock / burn", a:"Whether the deployer can withdraw the trading pool. Locked means held in a time-lock contract; burned means the keys are destroyed permanently.<br><br><b>Unlocked liquidity is how most rug pulls actually happen</b> \u2014 the deployer removes the pool and every holder is left with tokens nobody can buy."},
+  {q:"Holder concentration", a:"How much of the supply sits in a handful of wallets. If the top 10 hold 60%, a few people can end the token in one transaction.<br><br>Check the deployer specifically. A deployer holding 30% is a countdown, not a coin."},
+  {q:"Volume vs turnover", a:"Volume is dollars traded. Turnover compares that to pool size \u2014 $1M of volume against $50K of liquidity is 20x turnover.<br><br>Some turnover means genuine interest. Extreme turnover usually means wash trading: the same money cycling to fake activity and attract buyers."},
+  {q:"Buy/sell pressure", a:"The ratio of buy to sell transactions. Above about 60% buys suggests accumulation; heavy sells while price holds up often means insiders distributing into anyone still buying."},
+  {q:"Why most tokens go to zero", a:"Launching one costs almost nothing, so thousands appear daily and nearly all are scams or abandoned. Even honest projects usually fail for want of attention.<br><br><b>This is the base rate, and no scanner changes it.</b> RibbitPad filters out obvious traps \u2014 it cannot make a token succeed. Assume any single position can go to zero, and size so that outcome is survivable."},
+  {q:"Stop loss", a:"A price where you exit and accept the loss. Setting it before you buy is the entire point: the decision gets made calmly rather than while watching money evaporate.<br><br>On volatile microcaps a tight stop just pays fees twice on normal noise, which is why the default here is wide (35%)."},
+  {q:"Taking profit in steps", a:"Selling portions on the way up instead of guessing the top. The standard first step is selling half at 2x, which returns your original stake \u2014 everything after is playing with money you did not start with.<br><br>Most people lose gains they already had by holding for a bigger number. Steps remove that decision."},
+  {q:"Expectancy", a:"Your average profit or loss per trade across everything you have done. It is the only number that tells you whether an approach works.<br><br>You can win 30% of the time and make money if the wins are large. You can win 70% and lose money if the losses are. Log every trade, especially the bad ones, or the number is fiction."},
+  {q:"Position sizing", a:"How much you put into each trade. It matters more than picking well.<br><br>With small positions a total loss is information you paid a little for. With large ones it is a problem. Nobody has been ruined by a position that was too small."},
+  {q:"Grades in this app", a:"A grade measures <b>structure</b> \u2014 liquidity depth, distribution, deployer holdings, buying pressure, room to grow. It says the token is not obviously rigged to fail.<br><br><b>It is not a prediction.</b> A-graded tokens go to zero regularly; that is the normal outcome for microcaps, not a malfunction. Treat it as a filter for where to look, never as a reason to size up."},
+  {q:"Why 'unverified' is not 'safe'", a:"Security providers index new contracts on a delay, so anything a few hours old often has no record at all. RibbitPad shows these separately rather than hiding or approving them.<br><br>Unverified means nobody has checked it \u2014 the riskiest category, and also where the biggest moves start. Both are true at once."}
+];
+
+function learnHTML(){
+  var h='<div class="banner info"><b>Learn the terms</b><br><br>'+
+    'Every metric this app uses, explained plainly \u2014 including what each one '+
+    'genuinely tells you and where it can mislead. Tap any to open.</div>';
+  LEARN.forEach(function(item,i){
+    var op=!!S.learnOpen[i];
+    h+='<div style="margin:0 18px 9px;border:1px solid var(--line);border-radius:10px;overflow:hidden">'+
+      '<button data-learn="'+i+'" style="width:100%;text-align:left;padding:14px;background:var(--raised);'+
+      'border:none;color:var(--text);font-size:15px;font-weight:700;font-family:var(--font);cursor:pointer;'+
+      'display:flex;justify-content:space-between;gap:10px;align-items:center">'+
+      '<span>'+esc(item.q)+'</span><span style="color:var(--dim);font-size:13px">'+(op?"\u25b4":"\u25be")+'</span></button>'+
+      (op?'<div style="padding:14px;font-size:14.5px;line-height:1.75;color:var(--text2);'+
+        'border-top:1px solid var(--line)">'+item.a+'</div>':'')+
+      '</div>';
+  });
+  return h;
+}
+
 function cfgPane(){
+  if(S.showLearn){
+    return '<div class="toolbar"><button class="primary" id="backSettings">\u2190 Back to settings</button></div>'+learnHTML();
+  }
   var c=S.cfg;
   function sw(id,on){return '<div class="sw'+(on?" on":"")+'" id="'+id+'"><i></i></div>';}
   var gh='<div class="chainbar" style="border-bottom:none;padding:0 0 4px">';
-  ["F","D","C","C+","B","B+","A","A+"].forEach(function(g){
+  ["F","D","C-","C","C+","B-","B","B+","A-","A","A+"].forEach(function(g){
     gh+='<div class="cpill'+(c.minGrade===g?" on":"")+'" data-grade="'+g+'">'+g+'</div>';});
   gh+='</div>';
 
   var need=Math.max(c.minLiqFloor,c.sizeUsd*c.liqMultiple);
 
   return ''+
+  '<div class="toolbar"><button class="primary" id="openLearn">\ud83d\udcd8 Learn the terms</button></div>'+
   '<div class="banner info">Your stake is <b>'+usd(c.sizeUsd)+'</b>. At that size a token needs about <b>'+
   compact(need)+'</b> of liquidity, and anything costing more than <b>'+usd(c.sizeUsd*c.maxFeeDragPct/100)+
   '</b> in total fees gets blocked.</div>'+
@@ -3143,6 +3496,14 @@ function cfgPane(){
   '<div class="field"><label>Daily loss limit</label><input id="cDayLoss" type="number" inputmode="decimal" value="'+c.dailyLossLimit+'" />'+
   '<div class="hint">Warns you when 24h realised losses pass this. Chasing losses is the most reliable way to turn a bad day into a bad month.</div></div>'+
 
+  '<div class="tog"><div><div class="t">Live prices</div><div class="s">Refresh prices on screen every '+
+  c.liveIntervalSec+'s. Requests are batched into one call per chain, and polling pauses when the tab '+
+  'is in the background.</div></div><div class="sw'+(c.liveEnabled?" on":"")+'" id="swLive"><i></i></div></div>'+
+
+  '<div class="field"><label>Live refresh (seconds)</label><input id="cLiveSec" type="number" inputmode="decimal" value="'+c.liveIntervalSec+'" />'+
+  '<div class="hint">Minimum 3. Faster is not necessarily better \u2014 the underlying data updates '+
+  'roughly every few seconds anyway, and tighter polling risks hitting the free rate limit.</div></div>'+
+
   '<div class="field"><label>Heat threshold</label><input id="cHeat" type="number" inputmode="decimal" value="'+c.heatThreshold+'" />'+
   '<div class="hint">Minimum build score for the Heat tab (0\u2013100). Lower shows more, earlier and noisier; higher shows only strong build-ups.</div></div>'+
 
@@ -3172,14 +3533,17 @@ function render(){
     '<img class="logo" src="logo.jpg" alt="RibbitPad" onerror="this.style.display=\'none\';document.getElementById(\'lfb\').style.display=\'flex\'" />'+
     '<div class="logofb" id="lfb">🐸</div>'+
     '<div><h1>Ribbit<span>Pad</span></h1><p>small-stack token scanner</p></div></div>'+
-    '<div class="live'+(S.error?" off":"")+'">'+(S.error?"ERROR":"LIVE")+'</div></header>'+
+    '<div class="live'+(S.error?" off":"")+'" id="liveToggle" style="cursor:pointer">'+
+      (S.error?"ERROR":(S.cfg.liveEnabled?"\u25cf LIVE":"PAUSED"))+
+      '<span id="liveStamp" style="display:none"></span></div></header>'+
     stakeBar()+
     '<div class="tabs">'+
     '<button data-tab="scan" class="'+(S.tab==="scan"?"on":"")+'">Scan'+(shown?' <span class="n">'+shown+'</span>':'')+'</button>'+
     '<button data-tab="heat" class="'+(S.tab==="heat"?"on":"")+'">Heat'+
-      (S.heat.length?' <span class="n">'+S.heat.length+'</span>':'')+'</button>'+
+      (rankAndFilter(S.heat).length?' <span class="n">'+rankAndFilter(S.heat).length+'</span>':'')+'</button>'+
     '<button data-tab="fresh" class="'+(S.tab==="fresh"?"on":"")+'">New'+
-      ((S.fresh.length+S.freshUnverified.length)?' <span class="n">'+(S.fresh.length+S.freshUnverified.length)+'</span>':'')+'</button>'+
+      ((rankAndFilter(S.fresh).length+rankAndFilter(S.freshUnverified).length)?' <span class="n">'+
+        (rankAndFilter(S.fresh).length+rankAndFilter(S.freshUnverified).length)+'</span>':'')+'</button>'+
     '<button data-tab="watch" class="'+(S.tab==="watch"?"on":"")+'">Watch'+(S.watch.length?' <span class="n">'+S.watch.length+'</span>':'')+'</button>'+
     '<button data-tab="journal" class="'+(S.tab==="journal"?"on":"")+'">Log'+
       (S.trades.filter(function(t){return t.status==="open";}).length?' <span class="n">'+S.trades.filter(function(t){return t.status==="open";}).length+'</span>':'')+'</button>'+
@@ -3219,6 +3583,21 @@ function render(){
       render();
     };});
 
+  // keep the feed aligned with what's on screen
+  if(S.cfg.liveEnabled&&!IS_LOCAL_FILE){ if(!LIVE.running)startLive(); else liveTick(); }
+  else stopLive();
+
+  var ol=document.getElementById("openLearn");
+  if(ol)ol.onclick=function(){S.showLearn=true;render();};
+  var bs=document.getElementById("backSettings");
+  if(bs)bs.onclick=function(){S.showLearn=false;render();};
+  Array.prototype.forEach.call(app.querySelectorAll("[data-learn]"),function(b){
+    b.onclick=function(){var i=b.getAttribute("data-learn");
+      S.learnOpen[i]=!S.learnOpen[i];render();};});
+
+  var lt=document.getElementById("liveToggle");
+  if(lt)lt.onclick=function(){S.cfg.liveEnabled=!S.cfg.liveEnabled;saveCfg();restartLive();render();};
+
   var r=document.getElementById("refresh");if(r)r.onclick=runScan;
   var di=document.getElementById("dismissIntro");
   if(di)di.onclick=function(){S.seenIntro=true;S.cfg.seenIntro=true;saveCfg();render();};
@@ -3254,6 +3633,20 @@ function render(){
         var p=pool[i];
         if(((p.baseToken&&p.baseToken.address)||"")===addr){logTrade(p);return;}
       }
+    };});
+  Array.prototype.forEach.call(app.querySelectorAll("[data-saveentry]"),function(b){
+    b.onclick=function(){
+      var id=b.getAttribute("data-saveentry");
+      var t=null; S.trades.forEach(function(x){if(x.id===id)t=x;});
+      if(!t)return;
+      var eIn=app.querySelector('.entryIn[data-entry="'+id+'"]');
+      var sIn=app.querySelector('.sizeIn[data-size="'+id+'"]');
+      var ev=eIn?parseFloat(eIn.value):NaN, sv=sIn?parseFloat(sIn.value):NaN;
+      if(isFinite(ev)&&ev>0)t.entry=ev;
+      if(isFinite(sv)&&sv>0)t.size=sv;
+      saveTrades();
+      S.journalNote="Updated "+t.sym+" \u2014 entry "+px(t.entry)+", size "+usd(t.size)+".";
+      render();
     };});
   Array.prototype.forEach.call(app.querySelectorAll("[data-close]"),function(b){
     b.onclick=function(){
@@ -3309,6 +3702,8 @@ function render(){
   function bind(id,k){var el=document.getElementById(id);
     if(el)el.onclick=function(){S.cfg[k]=!S.cfg[k];saveCfg();render();};}
   bind("swStrict","strict");bind("swLp","requireLpLock");bind("swHide","hideBlocked");
+  var swL=document.getElementById("swLive");
+  if(swL)swL.onclick=function(){S.cfg.liveEnabled=!S.cfg.liveEnabled;saveCfg();restartLive();render();};
 
   var sv=document.getElementById("saveCfg");
   if(sv)sv.onclick=function(){
@@ -3321,6 +3716,7 @@ function render(){
     c.maxExposureUsd=Math.max(1,gv("cMaxExp",c.maxExposureUsd,1));
     c.dailyLossLimit=Math.max(1,gv("cDayLoss",c.dailyLossLimit,1));
     c.heatThreshold=Math.max(0,Math.min(100,gv("cHeat",c.heatThreshold,0)));
+    c.liveIntervalSec=Math.max(3,gv("cLiveSec",c.liveIntervalSec,3));
     c.freshMinAgeH=gv("cFreshMin",c.freshMinAgeH);
     c.freshMaxAgeH=Math.max(1,gv("cFreshMax",c.freshMaxAgeH,1));
     c.freshMinLiq=gv("cFreshLiq",c.freshMinLiq);
@@ -3335,7 +3731,7 @@ function render(){
     if(t){var pr=t.value.split(",").map(function(x){return parseFloat(x.trim());})
       .filter(function(x){return isFinite(x)&&x>1;});if(pr.length)c.tp=pr;}
     saveCfg();
-    S.tab="scan";render();
+    S.tab="scan";restartLive();render();
   };
 }
 
