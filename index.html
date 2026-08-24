@@ -357,6 +357,7 @@ function gtNormalize(pool, netSlug){
       txns:{h24:txn("h24"),h6:txn("h6"),h1:txn("h1")},
       pairCreatedAt:a.pool_created_at?new Date(a.pool_created_at).getTime():null,
       baseToken:{address:addr,symbol:nm||"?",name:a.name||""},
+      pairAddress:a.address||"",
       url:"https://www.geckoterminal.com/"+net+"/pools/"+(a.address||""),
       _src:"geckoterminal"
     };
@@ -485,7 +486,7 @@ var S={
   watch:[], watchData:{}, watchLoading:false, watchErr:null, watchInput:"",
   wallets:[], walletInput:"",
   trades:[], tradesLoading:false, journalNote:null, expanded:{}, seenIntro:false,
-  showLearn:false, learnOpen:{},
+  showLearn:false, learnOpen:{}, logPrompt:null,
   watching:false, watchTimer:null, alerts:[], notifOk:false
 };
 
@@ -1504,15 +1505,17 @@ function walletLinks(a){
 // win, average loss, and expectancy — the numbers that tell you whether a
 // strategy is working before your balance does.
 // ===========================================================================
-function logTrade(p){
+function logTrade(p,entryOverride,sizeOverride){
+  if(!p||!p._cv)return;
   var cv=p._cv, econ=p._econ;
   var t={
     id:String(Date.now())+"-"+Math.random().toString(36).slice(2,9),
     chain:p.chainId,
     addr:(p.baseToken&&p.baseToken.address)||"",
+    pair:p.pairAddress||"",
     sym:(p.baseToken&&p.baseToken.symbol)||"?",
-    entry:num(p.priceUsd),
-    size:S.cfg.sizeUsd,
+    entry:(entryOverride!=null&&isFinite(entryOverride)&&entryOverride>0)?entryOverride:num(p.priceUsd),
+    size:(sizeOverride!=null&&isFinite(sizeOverride)&&sizeOverride>0)?sizeOverride:S.cfg.sizeUsd,
     stopPct:S.cfg.stopPct,
     tps:S.cfg.tp.slice(),
     grade:cv?cv.grade:"?",
@@ -2179,6 +2182,26 @@ function livePriceHTML(p){
     '</div></div>';
 }
 
+var DEFINED_SLUG={
+  ethereum:"eth", bsc:"bsc", polygon:"polygon", arbitrum:"arb", optimism:"optimism",
+  avalanche:"avax", base:"base", fantom:"fantom", solana:"sol", blast:"blast",
+  linea:"linea", zksync:"zksync", scroll:"scroll", mantle:"mantle", cronos:"cronos",
+  sui:"sui", ton:"ton", sonic:"sonic", berachain:"berachain", unichain:"unichain",
+  pulsechain:"pulsechain", opbnb:"opbnb", gnosis:"gnosis"
+};
+// Defined.fi routes by network slug + PAIR address, not the token address.
+// Fall back to their search if no pair address is available.
+function definedUrl(p){
+  var slug=DEFINED_SLUG[p.chainId], pair=p.pairAddress||"";
+  if(slug&&pair) return "https://www.defined.fi/"+slug+"/"+encodeURIComponent(pair);
+  return "https://www.defined.fi/search?q="+encodeURIComponent((p.baseToken&&p.baseToken.address)||"");
+}
+function definedUrlFromTrade(t){
+  var slug=DEFINED_SLUG[t.chain];
+  if(slug&&t.pair) return "https://www.defined.fi/"+slug+"/"+encodeURIComponent(t.pair);
+  return "https://www.defined.fi/search?q="+encodeURIComponent(t.addr||"");
+}
+
 function copyCA(a,btn){
   function ok(){btn.textContent="Copied";setTimeout(function(){btn.textContent="Copy";},1400);}
   if(navigator.clipboard&&navigator.clipboard.writeText)
@@ -2302,10 +2325,37 @@ function cardHTML(p,isBlocked){
   if(!isBlocked&&cv&&(g.verdict==="pass"||g.verdict==="caution")) h+=buyPlanHTML(p);
   h+='<div class="ca"><code>'+esc(addr)+'</code><button data-copy="'+esc(addr)+'">Copy</button></div>';
   if(!isBlocked&&cv){
-    h+='<div class="toolbar" style="padding:11px 0 0;border:none">'+
-       '<button class="primary" data-log="'+esc(addr)+'">\u270e Log this trade</button></div>';
+    if(S.logPrompt&&S.logPrompt.addr===addr){
+      // Confirm the real fill before recording. The scan price is what the
+      // token cost when it was found, not what your wallet actually paid.
+      var liveNow=(LIVE.prices[liveKey(p.chainId,addr)]||{}).px||num(p.priceUsd);
+      h+='<div style="margin-top:12px;border:1.5px solid var(--frog);border-radius:11px;overflow:hidden">'+
+        '<div style="padding:12px 14px;background:#0D2109;font-size:13.5px;font-weight:800;color:var(--frog)">'+
+        'What did you actually pay?</div>'+
+        '<div style="padding:14px">'+
+        '<div class="row2">'+
+        '<div><label style="display:block;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;'+
+          'color:var(--dim);font-weight:700;margin-bottom:7px">Price you paid</label>'+
+          '<input id="logPx" inputmode="decimal" value="'+esc(String(liveNow))+'" /></div>'+
+        '<div><label style="display:block;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;'+
+          'color:var(--dim);font-weight:700;margin-bottom:7px">Amount spent</label>'+
+          '<input id="logSize" inputmode="decimal" value="'+esc(String(S.cfg.sizeUsd))+'" /></div>'+
+        '</div>'+
+        '<div class="hint" style="margin-top:9px">Live price is '+px(liveNow)+
+        '. Enter what your wallet actually filled at \u2014 slippage usually makes it a little different, '+
+        'and your stop, targets and P&amp;L are all calculated from this number.</div>'+
+        '<div class="toolbar" style="padding:12px 0 0;border:none">'+
+        '<button class="primary" data-logconfirm="'+esc(addr)+'">Confirm &amp; log</button>'+
+        '<button data-logcancel="1">Cancel</button></div>'+
+        '</div></div>';
+    } else {
+      h+='<div class="toolbar" style="padding:11px 0 0;border:none">'+
+         '<button class="primary" data-log="'+esc(addr)+'">\u270e Log this trade</button></div>';
+    }
   }
   var links='';
+  links+='<a href="'+esc(definedUrl(p))+'" target="_blank" rel="noopener" '+
+    'style="color:var(--frog);border-color:rgba(110,232,90,.45)">Trade on Defined ↗</a>';
   if(p.url)links+='<a href="'+esc(p.url)+'" target="_blank" rel="noopener">Chart ↗</a>';
   if(p.chainId==="solana")links+='<a href="https://rugcheck.xyz/tokens/'+esc(addr)+'" target="_blank" rel="noopener">RugCheck ↗</a>';
   else if(GP_CHAIN[p.chainId])links+='<a href="https://gopluslabs.io/token-security/'+esc(GP_CHAIN[p.chainId])+'/'+esc(addr)+'" target="_blank" rel="noopener">GoPlus ↗</a>';
@@ -2564,7 +2614,9 @@ function buyPlanHTML(p){
   h+='<span style="color:var(--dim);font-size:13.5px">If it reached every step you\'d have taken out about '+
      usd(cumulative)+' from a '+usd(size)+' entry, still holding '+(remainFrac*100).toFixed(0)+'%.</span><br>';
 
-  h+='<br><b>4. Log it</b> with the button below, then turn on <b>Watch my exits</b> in the Log tab '+
+  h+='<br><b>4. Trade it</b> \u2014 <a href="'+esc(definedUrl(p))+'" target="_blank" rel="noopener" '+
+     'style="color:var(--frog);font-weight:700;text-decoration:underline">open '+esc(sym)+' on Defined.fi \u2197</a>'+
+     '<br><b>5. Log it</b> with the button below, then turn on <b>Watch my exits</b> in the Log tab '+
      'so you get told exactly when each step triggers.'+
      '<br><br><span style="color:var(--dim);font-size:13px">This plan comes from the settings you set, '+
      'not from a prediction. Most tokens don\'t reach step 3.</span>'+
@@ -2932,17 +2984,17 @@ function journalPane(){
     steps.forEach(function(m,i){if(mult>=m)hitIdx=i;});
 
     if(t.live<=stop){
-      actions.push({u:0,sym:t.sym,addr:t.addr,act:"SELL ALL",price:t.live,
+      actions.push({u:0,sym:t.sym,addr:t.addr,chain:t.chain,pair:t.pair,act:"SELL ALL",price:t.live,
         why:"past your "+t.stopPct+"% stop \u2014 worth "+usd(value)+" now",col:"var(--red)"});
     } else if(hitIdx>=0){
       var sp=hitIdx===0?50:25;
-      actions.push({u:1,sym:t.sym,addr:t.addr,act:"SELL "+sp+"%",price:t.live,
+      actions.push({u:1,sym:t.sym,addr:t.addr,chain:t.chain,pair:t.pair,act:"SELL "+sp+"%",price:t.live,
         why:"hit "+steps[hitIdx]+"x \u2014 takes "+usd(value*sp/100)+" off the table",col:"var(--frog)"});
     } else if(pct<=-(t.stopPct*0.7)){
-      actions.push({u:2,sym:t.sym,addr:t.addr,act:"WATCH CLOSELY",price:t.live,
+      actions.push({u:2,sym:t.sym,addr:t.addr,chain:t.chain,pair:t.pair,act:"WATCH CLOSELY",price:t.live,
         why:pct.toFixed(0)+"%, stop at "+px(stop),col:"var(--amber)"});
     } else {
-      actions.push({u:3,sym:t.sym,addr:t.addr,act:"HOLD",price:t.live,
+      actions.push({u:3,sym:t.sym,addr:t.addr,chain:t.chain,pair:t.pair,act:"HOLD",price:t.live,
         why:(pct>=0?"+":"")+pct.toFixed(0)+"% \u2014 next target "+
           (steps.filter(function(m){return mult<m;})[0]||"\u2014")+"x at "+
           px(t.entry*(steps.filter(function(m){return mult<m;})[0]||1)),col:"var(--dim)"});
@@ -2964,7 +3016,10 @@ function journalPane(){
         '<span class="mono" style="font-size:14px">'+px(a.price)+'</span></div>'+
         '<div style="font-size:13.5px;color:var(--dim);margin-top:4px">'+esc(a.why)+'</div>'+
         (a.addr?'<div class="ca" style="margin-top:9px"><code>'+esc(a.addr)+'</code>'+
-          '<button data-copy="'+esc(a.addr)+'">Copy</button></div>':'')+
+          '<button data-copy="'+esc(a.addr)+'">Copy</button></div>'+
+          '<div class="links" style="margin-top:8px"><a href="'+esc(definedUrlFromTrade(a))+
+          '" target="_blank" rel="noopener" style="color:var(--frog);border-color:rgba(110,232,90,.45)">'+
+          'Open on Defined \u2197</a></div>':'')+
         '</div>';
     });
     h+='</div>';
@@ -3165,8 +3220,11 @@ function journalPane(){
       var chartUrl=t.chain==="solana"
         ? "https://dexscreener.com/solana/"+encodeURIComponent(t.addr)
         : "https://dexscreener.com/"+encodeURIComponent(t.chain||"ethereum")+"/"+encodeURIComponent(t.addr);
-      h+='<div class="links"><a href="'+esc(chartUrl)+'" target="_blank" rel="noopener">Chart \u2197</a>'+
-         '<a href="https://x.com/search?q='+encodeURIComponent(t.addr)+'&f=live" target="_blank" rel="noopener">Search X \u2197</a></div>';
+      h+='<div class="links">'+
+         '<a href="'+esc(definedUrlFromTrade(t))+'" target="_blank" rel="noopener" '+
+         'style="color:var(--frog);border-color:rgba(110,232,90,.45)">Defined \u2197</a>'+
+         '<a href="'+esc(chartUrl)+'" target="_blank" rel="noopener">Chart \u2197</a>'+
+         '<a href="https://x.com/search?q='+encodeURIComponent(t.addr)+'&f=live" target="_blank" rel="noopener">X \u2197</a></div>';
     }
 
     if(open){
@@ -3625,14 +3683,35 @@ function render(){
   var tc=document.getElementById("trCsv");if(tc)tc.onclick=exportTradesCSV;
   Array.prototype.forEach.call(app.querySelectorAll("[data-log]"),function(b){
     b.onclick=function(){
-      var addr=b.getAttribute("data-log");
-      var pool=S.passed.concat(S.fresh);
+      S.logPrompt={addr:b.getAttribute("data-log")};
+      render();
+    };});
+  Array.prototype.forEach.call(app.querySelectorAll("[data-logcancel]"),function(b){
+    b.onclick=function(){S.logPrompt=null;render();};});
+  Array.prototype.forEach.call(app.querySelectorAll("[data-logconfirm]"),function(b){
+    b.onclick=function(){
+      var addr=b.getAttribute("data-logconfirm");
+      var pxEl=document.getElementById("logPx"), szEl=document.getElementById("logSize");
+      var pv=pxEl?parseFloat(pxEl.value):NaN, sv=szEl?parseFloat(szEl.value):NaN;
+      if(!isFinite(pv)||pv<=0){S.journalNote="Enter the price you paid \u2014 it can't be blank or zero.";render();return;}
+      if(!isFinite(sv)||sv<=0){S.journalNote="Enter how much you spent.";render();return;}
+      var pool=S.passed.concat(S.unverified,S.heat,S.heatUnverified,S.fresh,S.freshUnverified);
       Object.keys(S.watchData).forEach(function(k){var d=S.watchData[k];if(d&&!d._err)pool.push(d);});
       if(S.lookup)pool.push(S.lookup);
       for(var i=0;i<pool.length;i++){
         var p=pool[i];
-        if(((p.baseToken&&p.baseToken.address)||"")===addr){logTrade(p);return;}
+        if(((p.baseToken&&p.baseToken.address)||"")===addr){
+          logTrade(p,pv,sv);
+          S.logPrompt=null;
+          S.journalNote="Logged "+((p.baseToken&&p.baseToken.symbol)||"trade")+" at "+px(pv)+
+            " for "+usd(sv)+". Open the Log tab to track it.";
+          render();
+          return;
+        }
       }
+      S.logPrompt=null;
+      S.journalNote="Couldn't find that token to log \u2014 try scanning again.";
+      render();
     };});
   Array.prototype.forEach.call(app.querySelectorAll("[data-saveentry]"),function(b){
     b.onclick=function(){
