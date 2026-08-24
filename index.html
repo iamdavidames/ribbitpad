@@ -699,7 +699,13 @@ function auditToken(c,a){
 // ===========================================================================
 // THE GATE
 // ===========================================================================
-function gate(pair,sec,econ){
+// opts.safetyOnly — used by the Check tab. Pasting an address asks "is this
+// safe to buy", not "does this fit my scanning strategy". Age, fee drag and
+// size-relative liquidity are strategy preferences, not safety properties, so
+// they become notes there. Every genuine SAFETY check still applies unchanged.
+function gate(pair,sec,econ,opts){
+  opts=opts||{};
+  var safetyOnly=!!opts.safetyOnly;
   var checks=[],blockers=[],warns=[],C=S.cfg,strict=C.strict;
   function add(s,l,v){checks.push({s:s,l:l,v:v||""});}
   function crit(cond,ok,bad){
@@ -830,7 +836,10 @@ function gate(pair,sec,econ){
 
   if(ratio>0&&ratio<0.02){add("no","Liquidity only "+(ratio*100).toFixed(1)+"% of FDV");blockers.push("liq/FDV too low");}
   else if(ratio>=0.05)add("ok","Liquidity "+(ratio*100).toFixed(1)+"% of FDV");
-  if(age!=null&&age<C.minAgeH){add("no","Only "+ageLbl(age)+" old (min "+C.minAgeH+"h)");blockers.push("too new");}
+  if(age!=null&&age<C.minAgeH){
+    if(safetyOnly){ add("wr","Only "+ageLbl(age)+" old \u2014 very early, and the riskiest window"); warns.push("very new"); }
+    else { add("no","Only "+ageLbl(age)+" old (min "+C.minAgeH+"h)"); blockers.push("too new"); }
+  }
   else if(age!=null)add("ok","Pair age "+ageLbl(age));
   if(vol<C.minVol){add("wr","24h volume "+compact(vol)+" below your floor");warns.push("low volume");}
   else add("ok","24h volume "+compact(vol));
@@ -1265,7 +1274,7 @@ function lookupOne(q){
       return auditToken(p.chainId,(p.baseToken&&p.baseToken.address)||q).then(function(sec){
         p._sec=sec;snapRecord(p,sec);p._dump=dumpRisk(p,sec);
         p._econ=tradeEconomics(p,sec);
-        p._gate=gate(p,sec,p._econ);p._cv=conviction(p,sec,p._econ);
+        p._gate=gate(p,sec,p._econ,{safetyOnly:true});p._cv=conviction(p,sec,p._econ);
         S.lookup=p;S.lookupLoading=false;render();
       });
     }).catch(function(e){
@@ -2191,15 +2200,24 @@ var DEFINED_SLUG={
 };
 // Defined.fi routes by network slug + PAIR address, not the token address.
 // Fall back to their search if no pair address is available.
+// Defined rebuilt their platform; the chart URLs that use network + pair
+// address now live on un.defined.fi (their "Classic" continuation). Building
+// against www.defined.fi returns 404. If no pair address is known there is no
+// valid direct URL, so fall back to DexScreener rather than a dead link.
 function definedUrl(p){
   var slug=DEFINED_SLUG[p.chainId], pair=p.pairAddress||"";
-  if(slug&&pair) return "https://www.defined.fi/"+slug+"/"+encodeURIComponent(pair);
-  return "https://www.defined.fi/search?q="+encodeURIComponent((p.baseToken&&p.baseToken.address)||"");
+  if(slug&&pair) return "https://un.defined.fi/"+slug+"/"+encodeURIComponent(pair);
+  return dexUrl(p.chainId,(p.baseToken&&p.baseToken.address)||"");
 }
 function definedUrlFromTrade(t){
   var slug=DEFINED_SLUG[t.chain];
-  if(slug&&t.pair) return "https://www.defined.fi/"+slug+"/"+encodeURIComponent(t.pair);
-  return "https://www.defined.fi/search?q="+encodeURIComponent(t.addr||"");
+  if(slug&&t.pair) return "https://un.defined.fi/"+slug+"/"+encodeURIComponent(t.pair);
+  return dexUrl(t.chain,t.addr||"");
+}
+// DexScreener accepts either a pair or a token address on every chain it
+// covers, which makes it a reliable fallback and a working trade link.
+function dexUrl(chain,addr){
+  return "https://dexscreener.com/"+encodeURIComponent(chain||"ethereum")+"/"+encodeURIComponent(addr||"");
 }
 
 function copyCA(a,btn){
@@ -2355,8 +2373,9 @@ function cardHTML(p,isBlocked){
   }
   var links='';
   links+='<a href="'+esc(definedUrl(p))+'" target="_blank" rel="noopener" '+
-    'style="color:var(--frog);border-color:rgba(110,232,90,.45)">Trade on Defined ↗</a>';
-  if(p.url)links+='<a href="'+esc(p.url)+'" target="_blank" rel="noopener">Chart ↗</a>';
+    'style="color:var(--frog);border-color:rgba(110,232,90,.45)">Defined ↗</a>';
+  links+='<a href="'+esc(p.url||dexUrl(p.chainId,addr))+'" target="_blank" rel="noopener" '+
+    'style="color:var(--frog);border-color:rgba(110,232,90,.45)">Trade ↗</a>';
   if(p.chainId==="solana")links+='<a href="https://rugcheck.xyz/tokens/'+esc(addr)+'" target="_blank" rel="noopener">RugCheck ↗</a>';
   else if(GP_CHAIN[p.chainId])links+='<a href="https://gopluslabs.io/token-security/'+esc(GP_CHAIN[p.chainId])+'/'+esc(addr)+'" target="_blank" rel="noopener">GoPlus ↗</a>';
   if(links)h+='<div class="links">'+links+'</div>';
@@ -2614,8 +2633,11 @@ function buyPlanHTML(p){
   h+='<span style="color:var(--dim);font-size:13.5px">If it reached every step you\'d have taken out about '+
      usd(cumulative)+' from a '+usd(size)+' entry, still holding '+(remainFrac*100).toFixed(0)+'%.</span><br>';
 
-  h+='<br><b>4. Trade it</b> \u2014 <a href="'+esc(definedUrl(p))+'" target="_blank" rel="noopener" '+
-     'style="color:var(--frog);font-weight:700;text-decoration:underline">open '+esc(sym)+' on Defined.fi \u2197</a>'+
+  h+='<br><b>4. Trade it</b> \u2014 <a href="'+esc(p.url||dexUrl(p.chainId,(p.baseToken&&p.baseToken.address)||""))+
+     '" target="_blank" rel="noopener" style="color:var(--frog);font-weight:700;text-decoration:underline">'+
+     'open '+esc(sym)+' \u2197</a>'+
+     ' <span style="color:var(--dim);font-size:13px">or <a href="'+esc(definedUrl(p))+
+     '" target="_blank" rel="noopener" style="color:var(--glass)">on Defined \u2197</a></span>'+
      '<br><b>5. Log it</b> with the button below, then turn on <b>Watch my exits</b> in the Log tab '+
      'so you get told exactly when each step triggers.'+
      '<br><br><span style="color:var(--dim);font-size:13px">This plan comes from the settings you set, '+
@@ -3423,6 +3445,67 @@ function similarNoteHTML(){
     '</div>';
 }
 
+// The plain answer to "is this safe to buy?" — stated first, before any
+// scores or charts. Safety here means: no scam mechanics detected. It never
+// means the price will rise, and it says so.
+function safetyVerdictHTML(p){
+  var g=p._gate, sec=p._sec||{}, dr=p._dump;
+  if(!g)return "";
+  var age=ageH(p.pairCreatedAt);
+  var veryNew=age!=null&&age<6;
+
+  var head,sub,col,icon;
+  if(g.verdict==="block"){
+    col="var(--red)"; icon="\u26d4"; head="NOT SAFE \u2014 DO NOT BUY";
+    sub="A scam mechanic or disqualifying risk was detected. Specifics below.";
+  } else if(g.verdict==="unverified"){
+    col="#C8C8C8"; icon="\u2753"; head="CANNOT VERIFY YET";
+    sub="No security provider has a record of this contract, which is normal for something this new. Nobody has checked it \u2014 including this app. Treat it as maximum risk.";
+  } else if(dr&&dr.severe>=1){
+    col="var(--amber)"; icon="\u26a0\ufe0f"; head="RISKY \u2014 PROCEED WITH CAUTION";
+    sub="No scam mechanics found, but there are active warning signs listed below.";
+  } else if(g.verdict==="caution"){
+    col="var(--amber)"; icon="\u26a0\ufe0f"; head="NO SCAMS FOUND \u2014 SOME WARNINGS";
+    sub="Every contract-safety check passed. The flags below are things to weigh, not scam mechanics.";
+  } else {
+    col="var(--frog)"; icon="\u2705"; head="NO SCAM MECHANICS FOUND";
+    sub="Every safety check passed: you can sell, supply can't be inflated, liquidity is locked, and no one wallet controls it.";
+  }
+
+  var h='<div style="margin:16px 18px;border:2px solid '+col+';border-radius:13px;overflow:hidden">'+
+    '<div style="padding:16px;background:rgba(255,255,255,.03)">'+
+    '<div style="font-size:19px;font-weight:800;color:'+col+';line-height:1.3">'+icon+' '+head+'</div>'+
+    '<div style="margin-top:9px;font-size:14.5px;line-height:1.65;color:var(--text2)">'+esc(sub)+'</div>';
+
+  if(g.verdict==="block"&&g.blockers.length){
+    h+='<div style="margin-top:12px;padding:11px;border-radius:9px;background:rgba(255,107,122,.1)">'+
+      '<div style="font-size:12.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--red);font-weight:800">Why</div>';
+    g.blockers.slice(0,5).forEach(function(b){
+      h+='<div style="margin-top:6px;font-size:14px;color:#FFC2C9">\u2715 '+esc(b)+'</div>';});
+    h+='</div>';
+  }
+
+  if(veryNew){
+    h+='<div style="margin-top:12px;padding:11px;border-radius:9px;background:rgba(255,194,77,.09);'+
+      'border:1px solid rgba(255,194,77,.3)">'+
+      '<div style="font-size:14px;line-height:1.65;color:#FFE0A8">'+
+      '<b>This is '+esc(ageLbl(age))+' old.</b> Early calls do sometimes go 2\u20135x \u2014 and the same '+
+      'window is where nearly every rug happens, because the deployer can still pull liquidity and the '+
+      'security databases have not indexed it yet.<br><br>'+
+      'What the checks above <i>can</i> tell you: whether it is a honeypot, whether supply can be minted, '+
+      'whether liquidity is locked, who holds what.<br>'+
+      'What nothing can tell you: whether the team sells tomorrow.</div></div>';
+  }
+
+  // The honest limit, stated every time — a pass is not a prediction.
+  h+='<div style="margin-top:12px;font-size:13.5px;line-height:1.65;color:var(--dim)">'+
+    '<b style="color:var(--text2)">What "safe" means here:</b> no scam mechanics were detected. '+
+    'It does not mean the price will rise. Clean tokens lose value every day \u2014 that is the normal '+
+    'outcome for microcaps. Only risk what you can lose entirely.</div>';
+
+  return h+'</div></div>';
+}
+
 function lookupPane(){
   var h='';
   if(S.journalNote){h+='<div class="banner info">'+esc(S.journalNote)+'</div>';S.journalNote=null;}
@@ -3435,7 +3518,8 @@ function lookupPane(){
   if(S.lookupLoading)return h+'<div class="empty"><div class="spinner"></div>Checking contract…</div>';
   if(S.lookupErr)return h+'<div class="banner err">'+esc(S.lookupErr)+'</div>';
   if(S.lookup){
-    h+=cardHTML(S.lookup,S.lookup._gate.verdict==="block");
+    h+=safetyVerdictHTML(S.lookup);
+    h+=cardHTML(S.lookup,!!(S.lookup._gate&&S.lookup._gate.verdict==="block"));
     var pr=similarProfile(S.lookup);
     h+='<div class="banner info" style="margin-top:0"><b>Want more like this?</b><br><br>'+
       (pr.alreadyRan
