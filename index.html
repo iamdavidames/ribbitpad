@@ -478,7 +478,7 @@ var S={
     strict:true, requireLpLock:true, hideBlocked:false, minGrade:"B-",
     auditLimit:100,        // how many candidates to deep-audit per scan
     freshMaxAgeH:48, freshMinAgeH:0.5, freshMinLiq:5000, freshSortBySurge:true,
-    maxOpenPositions:5, maxExposureUsd:50, dailyLossLimit:20, maxCreatorPct:10, seenIntro:false, heatThreshold:35, liveEnabled:true, liveIntervalSec:5
+    maxOpenPositions:5, maxExposureUsd:50, dailyLossLimit:20, maxCreatorPct:10, seenIntro:false, heatThreshold:35, startBalance:100, liveEnabled:true, liveIntervalSec:5
   },
   coverage:null,           // {found, chains, screened, audited} for transparency
   fresh:[], freshBlocked:[], freshUnverified:[], freshLoading:false, freshErr:null, freshCoverage:null,
@@ -486,7 +486,7 @@ var S={
   watch:[], watchData:{}, watchLoading:false, watchErr:null, watchInput:"",
   wallets:[], walletInput:"",
   trades:[], tradesLoading:false, journalNote:null, expanded:{}, seenIntro:false,
-  showLearn:false, learnOpen:{}, logPrompt:null,
+  showLearn:false, learnOpen:{}, logPrompt:null, showStats:false,
   watching:false, watchTimer:null, alerts:[], notifOk:false
 };
 
@@ -1514,7 +1514,7 @@ function walletLinks(a){
 // win, average loss, and expectancy — the numbers that tell you whether a
 // strategy is working before your balance does.
 // ===========================================================================
-function logTrade(p,entryOverride,sizeOverride){
+function logTrade(p,entryOverride,sizeOverride,paperMode){
   if(!p||!p._cv)return;
   var cv=p._cv, econ=p._econ;
   var t={
@@ -1523,6 +1523,31 @@ function logTrade(p,entryOverride,sizeOverride){
     addr:(p.baseToken&&p.baseToken.address)||"",
     pair:p.pairAddress||"",
     sym:(p.baseToken&&p.baseToken.symbol)||"?",
+    paper:(paperMode!==false),
+    remaining:1,
+    // Fingerprint captured at entry, never afterwards. Recording what the
+    // token looked like when you decided is the only way to learn anything
+    // from the outcome — measuring it later would be hindsight.
+    fp:(function(){
+      var f=(cv&&cv.f)||{};
+      var fdv=num(p.fdv||p.marketCap), liq=num(p.liquidity&&p.liquidity.usd);
+      var age=ageH(p.pairCreatedAt);
+      return {
+        grade:cv?cv.grade:"?", score:cv?cv.total:0,
+        chain:p.chainId||"?",
+        heat:(p._heat&&p._heat.score)||null,
+        fdv:fdv, fdvBand: fdv<100000?"<100K": fdv<500000?"100K-500K": fdv<2000000?"500K-2M": fdv<10000000?"2M-10M":">10M",
+        liqRatio: fdv>0?liq/fdv:0,
+        ageH: age, ageBand: age==null?"?": age<6?"<6h": age<24?"6-24h": age<72?"1-3d": age<336?"3-14d":">14d",
+        verdict:(p._gate&&p._gate.verdict)||"?",
+        dumpFlags:(p._dump&&p._dump.flags.filter(function(x){return x.s!=="ok";}).length)||0,
+        profile:(function(){var pm=profileMatch(p);return pm?pm.n:null;})(),
+        accel:Math.round(f.accel||0), turn:Math.round(f.turn||0), room:Math.round(f.room||0),
+        flow:Math.round(f.flow||0), liqF:Math.round(f.liq||0), dist:Math.round(f.dist||0)
+      };
+    })(),
+    events:[],
+    peak:0,
     entry:(entryOverride!=null&&isFinite(entryOverride)&&entryOverride>0)?entryOverride:num(p.priceUsd),
     size:(sizeOverride!=null&&isFinite(sizeOverride)&&sizeOverride>0)?sizeOverride:S.cfg.sizeUsd,
     stopPct:S.cfg.stopPct,
@@ -1559,6 +1584,91 @@ function deleteTrade(id){
 }
 
 // Live prices for open positions, so the journal shows where you actually are.
+// ===========================================================================
+// PAPER TRADE AUTO-RESOLUTION
+//
+// A logged paper trade plays itself out. Every price update it is checked
+// against the stop and the take-profit ladder that were set at entry, and
+// partial exits are executed exactly as the plan says — sell 50% at 2x, 25%
+// of what's left at 4x, and so on. The point is to find out what your rules
+// would actually have produced, with no hindsight and no discretion.
+// ===========================================================================
+function resolvePaper(t,price){
+  if(!t.paper||t.status!=="open"||!isFinite(price)||price<=0||!t.entry)return false;
+  var changed=false;
+  var mult=price/t.entry;
+  if(mult>t.peak)t.peak=mult;
+
+  var stop=t.entry*(1-t.stopPct/100);
+
+  // Stop first — if both a target and the stop are hit between updates, the
+  // pessimistic read is the honest one.
+  if(price<=stop){
+    // Fill AT the stop level, exactly as the plan states — same rule the
+    // take-profit rungs use. Note this is the optimistic reading: a real
+    // stop on a DEX often fills below the level during a fast drop, since
+    // you are selling manually into a falling market. Paper results here
+    // are therefore a best case on the downside.
+    var soldFrac=t.remaining;
+    var fillPrice=stop;
+    var proceeds=t.size*soldFrac*(fillPrice/t.entry);
+    var cost=t.size*soldFrac;
+    t.realized=(t.realized||0)+(proceeds-cost);
+    t.events.push({at:Date.now(),kind:"stop",price:fillPrice,pct:soldFrac*100,
+      note:"Stop hit \u2014 sold remaining "+(soldFrac*100).toFixed(0)+"% at "+px(fillPrice)+
+        " (\u2212"+t.stopPct+"% from entry)"});
+    t.remaining=0;t.status="closed";t.exitAt=Date.now();t.exit=fillPrice;
+    t.pnl=(t.realized||0)-(t.costs||0);
+    return true;
+  }
+
+  // Take-profit ladder, in order, each firing once
+  var steps=t.tps.slice().sort(function(a,b){return a-b;});
+  steps.forEach(function(m,idx){
+    if(t.events.some(function(ev){return ev.kind==="tp"&&ev.mult===m;}))return;
+    if(mult<m)return;
+    // On the final rung the remainder is sold too. A runner left open forever
+    // never resolves into a result, and the whole point here is to measure
+    // what the rules produced.
+    var isLast=idx===steps.length-1;
+    var sellPct=isLast?100:(idx===0?50:25);
+    var soldFrac=isLast?t.remaining:t.remaining*(sellPct/100);
+    if(soldFrac<=0)return;
+    var target=t.entry*m;
+    var proceeds=t.size*soldFrac*m;      // filled at the target price
+    var cost=t.size*soldFrac;
+    t.realized=(t.realized||0)+(proceeds-cost);
+    t.remaining-=soldFrac;
+    t.events.push({at:Date.now(),kind:"tp",mult:m,price:target,pct:sellPct,
+      note:"Hit "+m+"x \u2014 sold "+(isLast?"the remaining "+(soldFrac*100).toFixed(0)+"%":sellPct+"% of what was left")+
+        " for "+usd(t.size*soldFrac*m)});
+    changed=true;
+  });
+
+  // All targets taken: close it out
+  if(t.remaining<=0.001&&t.status==="open"){
+    var lastTarget=t.entry*steps[steps.length-1];
+    t.status="closed";t.exitAt=Date.now();t.exit=lastTarget;
+    t.pnl=(t.realized||0)-(t.costs||0);
+    t.events.push({at:Date.now(),kind:"done",price:price,note:"Every target reached \u2014 position fully closed"});
+    changed=true;
+  }
+  return changed;
+}
+
+// Runs on every price update, across every open paper trade.
+function resolveAllPaper(){
+  var any=false;
+  S.trades.forEach(function(t){
+    if(!t.paper||t.status!=="open")return;
+    var k=liveKey(t.chain,t.addr);
+    var lp=(LIVE.prices[k]||{}).px||t.live;
+    if(lp&&resolvePaper(t,lp))any=true;
+  });
+  if(any)saveTrades();
+  return any;
+}
+
 function refreshTrades(){
   if(IS_LOCAL_FILE){S.localBlocked=true;render();return;}
   var open=S.trades.filter(function(t){return t.status==="open";});
@@ -1576,14 +1686,19 @@ function refreshTrades(){
         }
       })
       .catch(function(){})
-      .then(function(){ if(--pending<=0){S.tradesLoading=false;render();} });
+      .then(function(){ if(--pending<=0){S.tradesLoading=false;resolveAllPaper();render();} });
   });
 }
 
 // Aggregate performance. Expectancy is the number that matters: average
 // dollars per trade. Positive means the approach pays over repetition.
-function journalStats(){
-  var closed=S.trades.filter(function(t){return t.status==="closed";});
+function journalStats(mode){
+  var closed=S.trades.filter(function(t){
+    if(t.status!=="closed")return false;
+    if(mode==="paper")return t.paper===true;
+    if(mode==="real")return t.paper!==true;
+    return true;
+  });
   if(!closed.length)return null;
   var wins=closed.filter(function(t){return t.pnl>0;});
   var losses=closed.filter(function(t){return t.pnl<=0;});
@@ -1742,11 +1857,367 @@ function riskStatus(){
   };
 }
 
-function exportTradesCSV(){
-  var rows=[["symbol","chain","address","grade","score","entry","exit","size_usd","costs_usd","pnl_usd","opened","closed","status"]];
+// ===========================================================================
+// LEARNING FROM YOUR OWN RESULTS
+//
+// Groups your closed trades by the characteristics they had at entry and
+// reports how each group actually performed. This is descriptive statistics
+// on your own data — not a model, and not clever. Its usefulness depends
+// almost entirely on sample size, so every conclusion here is gated behind
+// a minimum count and labelled with how confident it can possibly be.
+// ===========================================================================
+var LEARN_MIN_BUCKET=4;    // below this a bucket is noise
+var LEARN_MIN_TOTAL=15;    // below this no recommendations at all
+
+function learnBuckets(){
+  var closed=S.trades.filter(function(t){return t.status==="closed"&&t.fp&&isFinite(t.pnl);});
+  if(!closed.length)return null;
+
+  function group(keyFn,label){
+    var m={};
+    closed.forEach(function(t){
+      var k=keyFn(t.fp); if(k==null||k==="?")return;
+      m[k]=m[k]||{n:0,w:0,pnl:0};
+      m[k].n++; if(t.pnl>0)m[k].w++; m[k].pnl+=t.pnl;
+    });
+    var rows=Object.keys(m).map(function(k){
+      return {k:k,n:m[k].n,w:m[k].w,pnl:m[k].pnl,
+        winRate:(m[k].w/m[k].n)*100, exp:m[k].pnl/m[k].n};
+    }).filter(function(r){return r.n>=2;});
+    rows.sort(function(a,b){return b.exp-a.exp;});
+    return {label:label,rows:rows};
+  }
+
+  return {
+    total:closed.length,
+    byGrade:group(function(f){return f.grade;},"Grade at entry"),
+    byChain:group(function(f){return f.chain;},"Chain"),
+    byFdv:group(function(f){return f.fdvBand;},"Size when you bought"),
+    byAge:group(function(f){return f.ageBand;},"Age when you bought"),
+    byProfile:group(function(f){return f.profile==null?null:(f.profile>=5?"5-6 traits":f.profile>=3?"3-4 traits":"0-2 traits");},"Parabolic profile match"),
+    byHeat:group(function(f){return f.heat==null?null:(f.heat>=60?"heat 60+":f.heat>=35?"heat 35-59":"heat <35");},"Heat score"),
+    byVerdict:group(function(f){return f.verdict;},"Safety verdict")
+  };
+}
+
+// Only produce advice where a bucket is both large enough and clearly
+// different from the rest. Everything else stays silent.
+function learnFindings(){
+  var b=learnBuckets();
+  if(!b||b.total<LEARN_MIN_TOTAL)return {ready:false,total:b?b.total:0,findings:[]};
+  var out=[];
+
+  function scan(gr,kind){
+    var big=gr.rows.filter(function(r){return r.n>=LEARN_MIN_BUCKET;});
+    if(big.length<2)return;
+    var best=big[0], worst=big[big.length-1];
+    if(best.exp<=0&&worst.exp<=0){
+      out.push({tone:"bad",text:"Every "+gr.label.toLowerCase()+" group you have enough data on is losing money."});
+      return;
+    }
+    if(best.exp>0&&worst.exp<0&&(best.exp-worst.exp)>Math.abs(worst.exp)*0.5){
+      out.push({tone:"good",kind:kind,best:best.k,worst:worst.k,
+        text:gr.label+": <b>"+esc(best.k)+"</b> is working ("+best.n+" trades, "+
+          best.winRate.toFixed(0)+"% win, "+(best.exp>=0?"+":"")+usd(best.exp)+
+          " each) while <b>"+esc(worst.k)+"</b> is not ("+worst.n+" trades, "+
+          (worst.exp>=0?"+":"")+usd(worst.exp)+" each)."});
+    }
+  }
+  scan(b.byGrade,"grade"); scan(b.byChain,"chain"); scan(b.byFdv,"fdv");
+  scan(b.byAge,"age"); scan(b.byProfile,"profile"); scan(b.byHeat,"heat");
+  return {ready:true,total:b.total,findings:out,buckets:b};
+}
+
+function learnPanelHTML(){
+  var b=learnBuckets();
+  if(!b) return '<div class="banner info"><b>Nothing to learn from yet.</b><br><br>'+
+    'Once trades resolve, this tracks what your winners had in common \u2014 grade, chain, size, '+
+    'age, heat \u2014 and reports which of those actually made money for you.</div>';
+
+  var f=learnFindings();
+  var h='<div class="banner '+(f.ready?"info":"warn")+'"><b>What your results say</b><br><br>'+
+    b.total+' resolved trade'+(b.total===1?"":"s")+'. ';
+  if(!f.ready){
+    h+='Conclusions need at least '+LEARN_MIN_TOTAL+'. Below that, a couple of lucky trades look '+
+      'exactly like a working strategy \u2014 the data is shown below, but do not act on it yet.';
+  } else {
+    h+='Enough to start reading patterns, though '+b.total+' is still a small sample. '+
+      'Treat these as leads to test, not rules.';
+  }
+  h+='</div>';
+
+  if(f.ready&&f.findings.length){
+    f.findings.forEach(function(x){
+      var col=x.tone==="bad"?"var(--red)":"var(--frog)";
+      h+='<div style="margin:0 18px 10px;padding:14px;border-radius:11px;border:1.5px solid '+col+
+        ';background:rgba(255,255,255,.02);font-size:14.5px;line-height:1.65;color:var(--text2)">'+
+        x.text+'</div>';
+    });
+  } else if(f.ready){
+    h+='<div class="banner warn">No group stands out yet. Your results are spread fairly evenly, '+
+      'which usually means either the sample is still small or the filters are not the deciding factor.</div>';
+  }
+
+  // the raw tables, always shown
+  [b.byGrade,b.byProfile,b.byHeat,b.byFdv,b.byAge,b.byChain,b.byVerdict].forEach(function(gr){
+    if(!gr.rows.length)return;
+    h+='<div class="factors" style="margin:0 18px 12px"><div class="hd"><span>'+esc(gr.label)+
+      '</span><span>expectancy</span></div>';
+    gr.rows.forEach(function(r){
+      var col=r.exp>=0?"var(--frog)":"var(--red)";
+      var weak=r.n<LEARN_MIN_BUCKET;
+      h+='<div class="fac"><span class="fl">'+esc(r.k)+
+        (weak?' <span style="color:var(--dim);font-size:12px">(only '+r.n+')</span>':'')+'</span>'+
+        '<span class="fw">'+r.w+'/'+r.n+'</span>'+
+        '<span class="fv" style="color:'+(weak?"var(--dim)":col)+';width:auto">'+
+        (r.exp>=0?"+":"")+usd(r.exp)+'</span></div>';
+    });
+    h+='</div>';
+  });
+
+  h+='<div class="banner warn"><b>Why this is cautious.</b> With a few dozen trades, the difference '+
+    'between a real edge and a run of luck is genuinely hard to tell apart \u2014 and tightening filters '+
+    'to match past winners is the classic way to make a strategy look better historically and perform '+
+    'worse going forward. Groups with fewer than '+LEARN_MIN_BUCKET+' trades are greyed out for that reason.</div>';
+  return h;
+}
+
+// ===========================================================================
+// SIMULATED WALLET + CHARTS
+//
+// Treats every logged trade as if it came out of one pot, so you can see the
+// balance move rather than reading a list of percentages. Charts are hand-drawn
+// SVG — no libraries, works offline, and scales to whatever data exists.
+// ===========================================================================
+function walletHistory(mode){
+  var closed=S.trades.filter(function(t){
+    if(t.status!=="closed"||!isFinite(t.pnl))return false;
+    if(mode==="paper")return t.paper===true;
+    if(mode==="real")return t.paper!==true;
+    return true;
+  }).slice().sort(function(a,b){return (a.exitAt||a.opened)-(b.exitAt||b.opened);});
+
+  var bal=S.cfg.startBalance, peak=bal, maxDD=0;
+  var pts=[{i:0,bal:bal,pnl:0,sym:"start",at:closed.length?closed[0].opened:Date.now(),win:null}];
+  var wins=0;
+  closed.forEach(function(t,i){
+    bal+=t.pnl;
+    if(t.pnl>0)wins++;
+    if(bal>peak)peak=bal;
+    var dd=peak>0?((peak-bal)/peak)*100:0;
+    if(dd>maxDD)maxDD=dd;
+    pts.push({i:i+1,bal:bal,pnl:t.pnl,sym:t.sym,at:t.exitAt||t.opened,
+      win:t.pnl>0,rate:(wins/(i+1))*100});
+  });
+
+  // money currently tied up in open positions, valued live
+  var openVal=0,openCost=0;
   S.trades.forEach(function(t){
-    rows.push([t.sym,t.chain,t.addr,t.grade,t.score,t.entry,t.exit==null?"":t.exit,
-      t.size,(t.costs||0).toFixed(4),t.pnl==null?"":t.pnl.toFixed(4),
+    if(t.status!=="open")return;
+    if(mode==="paper"&&!t.paper)return;
+    if(mode==="real"&&t.paper)return;
+    openCost+=t.size*(t.remaining!=null?t.remaining:1);
+    var lp=t.live||t.entry;
+    openVal+=t.size*(t.remaining!=null?t.remaining:1)*(lp/t.entry);
+  });
+
+  return {pts:pts,closed:closed.length,final:bal,peak:peak,maxDD:maxDD,
+    openCost:openCost,openVal:openVal,
+    totalIfSoldNow:bal+openVal-openCost};
+}
+
+// Line chart. Zero-dependency SVG so it renders anywhere.
+function lineChartHTML(pts,opts){
+  opts=opts||{};
+  var W=1000,H=opts.height||220,pad={l:8,r:8,t:14,b:18};
+  if(pts.length<2)return '<div class="empty" style="padding:26px">Not enough resolved trades to chart yet.</div>';
+  var vals=pts.map(function(p){return p.v;});
+  var min=Math.min.apply(null,vals), max=Math.max.apply(null,vals);
+  if(min===max){min-=1;max+=1;}
+  var range=max-min, padR=range*0.12;
+  min-=padR; max+=padR; range=max-min;
+  var x=function(i){return pad.l+(i/(pts.length-1))*(W-pad.l-pad.r);};
+  var y=function(v){return pad.t+(1-(v-min)/range)*(H-pad.t-pad.b);};
+
+  var line=pts.map(function(p,i){return (i?"L":"M")+x(i).toFixed(1)+","+y(p.v).toFixed(1);}).join(" ");
+  var area=line+" L"+x(pts.length-1).toFixed(1)+","+(H-pad.b)+" L"+x(0).toFixed(1)+","+(H-pad.b)+" Z";
+  var up=pts[pts.length-1].v>=pts[0].v;
+  var col=opts.color||(up?"var(--frog)":"var(--red)");
+  var fill=up?"rgba(110,232,90,.14)":"rgba(255,107,122,.14)";
+
+  var h='<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" style="width:100%;height:'+H+'px;display:block">';
+  // baseline (starting value or zero line)
+  if(opts.baseline!=null&&opts.baseline>=min&&opts.baseline<=max){
+    h+='<line x1="'+pad.l+'" y1="'+y(opts.baseline).toFixed(1)+'" x2="'+(W-pad.r)+
+       '" y2="'+y(opts.baseline).toFixed(1)+'" stroke="var(--line2)" stroke-width="1.5" stroke-dasharray="6 6"/>';
+  }
+  h+='<path d="'+area+'" fill="'+fill+'"/>';
+  h+='<path d="'+line+'" fill="none" stroke="'+col+'" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>';
+  // mark each resolved trade
+  pts.forEach(function(p,i){
+    if(i===0)return;
+    var c=p.win===false?"var(--red)":p.win===true?"var(--frog)":col;
+    h+='<circle cx="'+x(i).toFixed(1)+'" cy="'+y(p.v).toFixed(1)+'" r="3.5" fill="'+c+'"/>';
+  });
+  h+='</svg>';
+  return h;
+}
+
+function walletPanelHTML(){
+  var w=walletHistory("paper");
+  var start=S.cfg.startBalance;
+  if(w.closed===0&&!w.openCost){
+    return '<div class="banner info"><b>Simulated wallet</b><br><br>'+
+      'Starts at '+usd(start)+'. Every paper trade takes its stake from here and returns whatever it '+
+      'made or lost, so you can watch a balance move instead of reading percentages.<br><br>'+
+      'Nothing logged yet.</div>';
+  }
+
+  var col=w.final>=start?"var(--frog)":"var(--red)";
+  var netPct=start>0?((w.final-start)/start)*100:0;
+  var liveCol=w.totalIfSoldNow>=start?"var(--frog)":"var(--red)";
+
+  var h='<div style="margin:16px 18px;border:2px solid '+col+';border-radius:13px;overflow:hidden">'+
+    '<div style="padding:14px;background:rgba(255,255,255,.03);display:flex;justify-content:space-between;'+
+    'align-items:baseline;gap:10px">'+
+    '<div><div style="font-size:12px;text-transform:uppercase;letter-spacing:.09em;color:var(--dim);'+
+    'font-weight:800">Simulated wallet</div>'+
+    '<div class="mono" style="font-size:28px;font-weight:800;color:'+col+';margin-top:5px">'+usd(w.final)+'</div></div>'+
+    '<div style="text-align:right"><div class="mono" style="font-size:17px;font-weight:800;color:'+col+'">'+
+    (netPct>=0?"+":"")+netPct.toFixed(1)+'%</div>'+
+    '<div style="font-size:11.5px;color:var(--dim);margin-top:3px">from '+usd(start)+'</div></div></div>';
+
+  // equity curve
+  var pts=w.pts.map(function(p){return {v:p.bal,win:p.win};});
+  h+='<div style="padding:4px 0 0">'+lineChartHTML(pts,{height:200,baseline:start})+'</div>';
+  h+='<div style="padding:0 14px 12px;display:flex;justify-content:space-between;font-size:11.5px;color:var(--dim)">'+
+    '<span>trade 1</span><span>'+w.closed+' resolved</span></div>';
+
+  h+='<div style="padding:0 14px 14px"><div style="display:flex;gap:8px">'+
+    '<div style="flex:1;padding:10px;border-radius:9px;background:var(--panel);border:1px solid var(--line)">'+
+      '<div style="font-size:10.5px;color:var(--dim);text-transform:uppercase">Best balance</div>'+
+      '<div class="mono" style="font-size:15px;font-weight:700;margin-top:3px">'+usd(w.peak)+'</div></div>'+
+    '<div style="flex:1;padding:10px;border-radius:9px;background:var(--panel);border:1px solid var(--line)">'+
+      '<div style="font-size:10.5px;color:var(--dim);text-transform:uppercase">Worst drop</div>'+
+      '<div class="mono" style="font-size:15px;font-weight:700;margin-top:3px;color:var(--red)">\u2212'+
+      w.maxDD.toFixed(0)+'%</div></div>'+
+    '<div style="flex:1;padding:10px;border-radius:9px;background:var(--panel);border:1px solid var(--line)">'+
+      '<div style="font-size:10.5px;color:var(--dim);text-transform:uppercase">Still open</div>'+
+      '<div class="mono" style="font-size:15px;font-weight:700;margin-top:3px">'+usd(w.openCost)+'</div></div>'+
+    '</div>';
+
+  if(w.openCost>0){
+    h+='<div style="margin-top:10px;font-size:13.5px;line-height:1.6;color:var(--text2)">'+
+      'Including open positions at their live value, the wallet would be <b style="color:'+liveCol+'">'+
+      usd(w.totalIfSoldNow)+'</b> if you sold everything now.</div>';
+  }
+  h+='<div style="margin-top:10px;font-size:13px;color:var(--dim);line-height:1.6">'+
+    'Worst drop is peak-to-trough \u2014 the deepest the balance fell from a high. It is the number '+
+    'that tells you whether you could actually have sat through this.</div>';
+  h+='</div></div>';
+
+  // win rate over time
+  var wr=w.pts.filter(function(p){return p.rate!=null;}).map(function(p){return {v:p.rate,win:p.win};});
+  if(wr.length>=2){
+    var last=wr[wr.length-1].v;
+    h+='<div style="margin:0 18px 16px;border:1px solid var(--line);border-radius:13px;overflow:hidden">'+
+      '<div style="padding:13px 14px;background:var(--raised);display:flex;justify-content:space-between">'+
+      '<span style="font-size:12px;text-transform:uppercase;letter-spacing:.09em;color:var(--text2);'+
+      'font-weight:800">Success rate</span>'+
+      '<span class="mono" style="font-size:15px;font-weight:800;color:'+
+      (last>=50?"var(--frog)":"var(--amber)")+'">'+last.toFixed(0)+'%</span></div>'+
+      lineChartHTML(wr,{height:150,color:"var(--blue)",baseline:50})+
+      '<div style="padding:10px 14px;font-size:13px;color:var(--dim);line-height:1.6">'+
+      'Running win rate after each trade. The dashed line is 50%. A low rate is not necessarily bad \u2014 '+
+      'one 10x pays for many stops, which is why the wallet above matters more than this.</div></div>';
+  }
+  return h;
+}
+
+// ===========================================================================
+// POST-MORTEM
+//
+// After a trade resolves, explain what happened in plain language and tie it
+// to something the beginner can use. Learning from your own trades beats
+// reading general advice, because the example is one you actually lived.
+// ===========================================================================
+function postMortem(t){
+  if(t.status!=="closed"||!t.fp)return null;
+  var f=t.fp;
+  var won=t.pnl>0;
+  var hitTargets=(t.events||[]).filter(function(e){return e.kind==="tp";});
+  var stopped=(t.events||[]).some(function(e){return e.kind==="stop";});
+  var mult=t.entry>0&&t.exit?t.exit/t.entry:null;
+
+  var story,lesson,tone;
+
+  if(hitTargets.length&&stopped){
+    tone="mixed";
+    story="It reached "+hitTargets[0].mult+"x, you took half off, then it fell back and the rest exited at your stop.";
+    lesson="This is the case that shows why selling in steps matters. Without that first sale at "+
+      hitTargets[0].mult+"x this trade would have been a straight loss; with it you finished "+
+      (won?"up "+usd(t.pnl):"down only "+usd(Math.abs(t.pnl)))+". Taking something off the table early "+
+      "is what turns some losers into break-evens.";
+  } else if(hitTargets.length>=3){
+    tone="win";
+    story="It ran the whole ladder \u2014 "+hitTargets.map(function(e){return e.mult+"x";}).join(", ")+
+      " \u2014 and closed out at the top rung.";
+    lesson="One trade like this pays for a lot of stopped-out ones. That is the whole economics of "+
+      "microcaps: you are not trying to be right often, you are trying to be positioned when a rare "+
+      "one runs. Which is also why the position size has to be small enough that you can afford to "+
+      "keep taking the losses in between.";
+  } else if(hitTargets.length){
+    tone="win";
+    story="It hit "+hitTargets.map(function(e){return e.mult+"x";}).join(" then ")+" and closed there.";
+    lesson="A clean win. Worth noticing what it looked like at entry \u2014 "+esc(f.fdvBand)+" size, "+
+      esc(f.ageBand)+" old, grade "+esc(f.grade)+" \u2014 and whether your other winners share that shape.";
+  } else if(stopped){
+    tone="loss";
+    story="It never reached your first target and exited at the stop, down "+t.stopPct+"% from entry.";
+    var bits=[];
+    if(f.accel!=null&&f.accel<45)bits.push("activity was not really building when you entered (acceleration "+f.accel+"/100)");
+    if(f.flow!=null&&f.flow<45)bits.push("sellers were already leading (flow "+f.flow+"/100)");
+    if(f.room!=null&&f.room<45)bits.push("it was already fairly large, so there was less room to run (headroom "+f.room+"/100)");
+    if(f.profile!=null&&f.profile<=2)bits.push("it only matched "+f.profile+" of 6 parabolic traits");
+    lesson=bits.length
+      ? "Looking back at the entry: "+bits.join("; ")+". Worth checking whether your losers keep sharing those numbers \u2014 that is what the What's Working tab is for."
+      : "Nothing about the entry looks obviously wrong; the metrics were reasonable and it still went down. "+
+        "That happens constantly and is not a mistake. Most tokens fail regardless of how they look. "+
+        "A loss with a sound setup is the cost of doing this, not evidence you chose badly.";
+  } else {
+    tone="mixed";
+    story="It closed without hitting either your stop or a target.";
+    lesson="Partial or manual exits are harder to learn from, because you cannot tell what the plan "+
+      "would have produced. Letting them run to a stop or target keeps the data clean.";
+  }
+
+  return {tone:tone,story:story,lesson:lesson,won:won,mult:mult};
+}
+
+function postMortemHTML(t){
+  var pm=postMortem(t); if(!pm)return "";
+  var col=pm.tone==="win"?"var(--frog)":pm.tone==="loss"?"var(--red)":"var(--amber)";
+  var icon=pm.tone==="win"?"\u2705":pm.tone==="loss"?"\u274c":"\u2696\ufe0f";
+  return '<div style="margin-top:12px;border:1px solid '+col+';border-radius:11px;overflow:hidden">'+
+    '<div style="padding:11px 14px;background:rgba(255,255,255,.03);font-size:12px;text-transform:uppercase;'+
+    'letter-spacing:.09em;font-weight:800;color:'+col+'">'+icon+' What this trade taught</div>'+
+    '<div style="padding:14px;font-size:14.5px;line-height:1.7;color:var(--text2)">'+
+    '<b style="color:var(--text)">'+esc(pm.story)+'</b><br><br>'+pm.lesson+'</div></div>';
+}
+
+function exportTradesCSV(){
+  var rows=[["symbol","chain","address","paper","grade","score","heat","fdv","fdv_band",
+    "age_hours","age_band","liq_ratio","profile_traits","verdict","accel","turn","room","flow",
+    "entry","exit","size_usd","costs_usd","pnl_usd","opened","closed","status"]];
+  S.trades.forEach(function(t){
+    var f=t.fp||{};
+    rows.push([t.sym,t.chain,t.addr,t.paper?"paper":"real",
+      f.grade||t.grade||"",f.score||t.score||"",f.heat==null?"":f.heat,
+      f.fdv||"",f.fdvBand||"",f.ageH==null?"":f.ageH.toFixed(1),f.ageBand||"",
+      f.liqRatio==null?"":f.liqRatio.toFixed(4),f.profile==null?"":f.profile,f.verdict||"",
+      f.accel==null?"":f.accel,f.turn==null?"":f.turn,f.room==null?"":f.room,f.flow==null?"":f.flow,
+      t.entry,t.exit==null?"":t.exit,t.size,(t.costs||0).toFixed(4),
+      t.pnl==null?"":t.pnl.toFixed(4),
       new Date(t.opened).toISOString(),t.exitAt?new Date(t.exitAt).toISOString():"",t.status]);
   });
   var csv=rows.map(function(r){return r.map(function(c){
@@ -2102,7 +2573,7 @@ function liveTick(){
       syncLive(k,next);
     });
     LIVE.lastTick=Date.now();
-    paintLive();
+    if(resolveAllPaper()) render(); else paintLive();
   }).catch(function(){}).then(function(){LIVE.inflight=false;});
 }
 
@@ -2302,7 +2773,7 @@ function cardHTML(p,isBlocked){
     h+='</div>';
     h+=deployerHTML(p,sec);
     if(cv&&!isBlocked){
-      h+='<div class="factors"><div class="hd"><span>Setup factors</span><span>'+cv.total.toFixed(0)+'/100</span></div>';
+      h+='<div class="factors"><div class="hd"><span>'+learnLink("Setup factors","Grades in this app")+'</span><span>'+cv.total.toFixed(0)+'/100</span></div>';
       FACTORS.forEach(function(F){
         var val=cv.f[F.k];
         var c2=val>=70?"var(--frog)":val>=45?"var(--amber)":"var(--red)";
@@ -2318,9 +2789,9 @@ function cardHTML(p,isBlocked){
     h+=livePriceHTML(p);
     var lk=liveKey(p.chainId,addr);
     h+='<div class="grid">'+
-      '<div class="cell"><div class="k">Liquidity</div><div class="v" data-live="'+lk+'" data-livefield="liq">'+
+      '<div class="cell"><div class="k">'+learnLink("Liquidity")+'</div><div class="v" data-live="'+lk+'" data-livefield="liq">'+
         compact(num(p.liquidity&&p.liquidity.usd))+'</div></div>'+
-      '<div class="cell"><div class="k">FDV</div><div class="v">'+compact(num(p.fdv||p.marketCap))+'</div></div>'+
+      '<div class="cell"><div class="k">'+learnLink("FDV","FDV / Market cap")+'</div><div class="v">'+compact(num(p.fdv||p.marketCap))+'</div></div>'+
       '</div>';
 
     var L=levels(price,econ);
@@ -2586,9 +3057,29 @@ function logButtonHTML(p,addr){
       '<input class="logSzIn" data-sz="'+esc(addr)+'" inputmode="decimal" value="'+esc(String(S.cfg.sizeUsd))+'" /></div>'+
     '</div>'+
     '<div class="hint" style="margin-top:9px">Live price is '+px(liveNow)+
-    '. Enter what your wallet actually filled at \u2014 your stop, targets and P&amp;L all come from this.</div>'+
+    '. For a paper trade leave it as-is; for a real one enter what your wallet filled at.</div>'+
+
+    '<div style="margin-top:13px;display:flex;gap:8px">'+
+    '<button data-logmode="paper" style="flex:1;padding:12px 6px;border-radius:9px;font-size:13.5px;'+
+      'font-weight:700;font-family:var(--font);cursor:pointer;border:1.5px solid '+
+      (S.logPrompt.real?"var(--line)":"var(--frog)")+';background:'+
+      (S.logPrompt.real?"var(--raised)":"#0D2109")+';color:'+
+      (S.logPrompt.real?"var(--text2)":"var(--frog)")+'">\ud83e\uddea Paper trade</button>'+
+    '<button data-logmode="real" style="flex:1;padding:12px 6px;border-radius:9px;font-size:13.5px;'+
+      'font-weight:700;font-family:var(--font);cursor:pointer;border:1.5px solid '+
+      (S.logPrompt.real?"var(--amber)":"var(--line)")+';background:'+
+      (S.logPrompt.real?"#181206":"var(--raised)")+';color:'+
+      (S.logPrompt.real?"var(--amber)":"var(--text2)")+'">\ud83d\udcb0 Real money</button>'+
+    '</div>'+
+    '<div style="margin-top:9px;font-size:13px;line-height:1.6;color:var(--dim)">'+
+    (S.logPrompt.real
+      ? "Recorded as a real position. You close it yourself at the price you actually sold for."
+      : "Runs itself: sells at each target, exits at your stop, and records the result. Nothing is bought \u2014 it just shows what your rules would have done.")+
+    '</div>'+
+
     '<div class="toolbar" style="padding:12px 0 0;border:none">'+
-    '<button class="primary" data-logconfirm="'+esc(addr)+'">Confirm &amp; log</button>'+
+    '<button class="primary" data-logconfirm="'+esc(addr)+'">'+
+      (S.logPrompt.real?"Log real trade":"Start paper trade")+'</button>'+
     '<button data-logcancel="1">Cancel</button></div>'+
     '</div></div>';
 }
@@ -2977,9 +3468,16 @@ function watchPane(){
 
 function journalPane(){
   var st=journalStats();
+  var pst=journalStats("paper");
   var h='<div class="toolbar">'+
     '<button class="primary" id="trRef">'+(S.tradesLoading?"Updating…":"Update prices")+'</button>'+
-    (S.trades.length?'<button id="trCsv">Export CSV</button>':'')+'</div>';
+    (S.trades.length?'<button id="showStats">\ud83d\udcca What\u2019s working</button>':'')+
+    (S.trades.length?'<button id="trCsv">CSV</button>':'')+'</div>';
+
+  if(S.showStats){
+    return '<div class="toolbar"><button class="primary" id="backJournal">\u2190 Back to trades</button></div>'+
+      learnPanelHTML();
+  }
 
   var openN=S.trades.filter(function(t){return t.status==="open";}).length;
   if(openN){
@@ -3093,6 +3591,55 @@ function journalPane(){
       'Most people can\'t say what their actual hit rate is, so they never find out whether their approach works \u2014 they just watch the balance move. Logging every entry turns that into real numbers: win rate, average win vs average loss, and expectancy (average dollars per trade).<br><br>'+
       'Expectancy is the one that matters. Positive means the approach pays over repetition. Negative means it doesn\'t, no matter how good any single trade felt.</div>'+
       '<div class="empty">No trades logged yet.<br><br>When you buy something, tap <b>Log this trade</b> on its card in Scan, New, or Watch.</div>';
+  }
+
+  h+=walletPanelHTML();
+
+  // ---- paper results: the whole point of the dry run ----
+  if(pst){
+    var ppc=pst.totalPnl>=0?"var(--frog)":"var(--red)";
+    var pec=pst.expectancy>=0?"var(--frog)":"var(--red)";
+    var openPaper=S.trades.filter(function(t){return t.paper&&t.status==="open";}).length;
+    h+='<div style="margin:16px 18px;border:2px solid '+ppc+';border-radius:13px;overflow:hidden">'+
+      '<div style="padding:14px;background:rgba(255,255,255,.03);font-size:13px;text-transform:uppercase;'+
+      'letter-spacing:.09em;font-weight:800;color:'+ppc+';display:flex;justify-content:space-between">'+
+      '<span>\ud83e\uddea Paper results</span><span style="font-family:var(--mono);font-size:12px">'+
+      pst.n+' resolved'+(openPaper?" \u00b7 "+openPaper+" running":"")+'</span></div>'+
+      '<div style="padding:16px">'+
+      '<div style="display:flex;gap:9px">'+
+      '<div style="flex:1;padding:11px;border-radius:9px;background:var(--panel);border:1px solid var(--line)">'+
+        '<div style="font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">Win rate</div>'+
+        '<div class="mono" style="font-size:19px;font-weight:800;margin-top:4px">'+pst.winRate.toFixed(0)+'%</div>'+
+        '<div style="font-size:11.5px;color:var(--dim);margin-top:2px">'+pst.wins+'W / '+pst.losses+'L</div></div>'+
+      '<div style="flex:1;padding:11px;border-radius:9px;background:var(--panel);border:1px solid var(--line)">'+
+        '<div style="font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">Per trade</div>'+
+        '<div class="mono" style="font-size:19px;font-weight:800;margin-top:4px;color:'+pec+'">'+
+        (pst.expectancy>=0?"+":"")+usd(pst.expectancy)+'</div>'+
+        '<div style="font-size:11.5px;color:var(--dim);margin-top:2px">expectancy</div></div>'+
+      '<div style="flex:1;padding:11px;border-radius:9px;background:var(--panel);border:1px solid var(--line)">'+
+        '<div style="font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">Total</div>'+
+        '<div class="mono" style="font-size:19px;font-weight:800;margin-top:4px;color:'+ppc+'">'+
+        (pst.totalPnl>=0?"+":"")+usd(pst.totalPnl)+'</div>'+
+        '<div style="font-size:11.5px;color:var(--dim);margin-top:2px">simulated</div></div>'+
+      '</div>'+
+      '<div style="margin-top:12px;font-size:13.5px;line-height:1.65;color:var(--text2)">'+
+      'Average win '+usd(pst.avgWin)+' \u00b7 average loss '+usd(pst.avgLoss)+
+      ' \u00b7 fees counted '+usd(pst.totalFees)+'.</div>';
+
+    if(pst.n<10){
+      h+='<div style="margin-top:11px;font-size:13.5px;line-height:1.65;color:var(--amber)">'+
+        '<b>'+pst.n+' resolved so far.</b> Below about 20 this number is mostly noise \u2014 a couple of '+
+        'lucky or unlucky trades swing it hard. Keep logging before you read anything into it.</div>';
+    } else if(pst.expectancy<0){
+      h+='<div style="margin-top:11px;font-size:13.5px;line-height:1.65;color:var(--red)">'+
+        '<b>Negative expectancy across '+pst.n+' trades.</b> On this evidence the approach loses about '+
+        usd(Math.abs(pst.expectancy))+' per trade. Worth finding out now, on paper, rather than with money.</div>';
+    } else {
+      h+='<div style="margin-top:11px;font-size:13.5px;line-height:1.65;color:var(--frog)">'+
+        '<b>Positive expectancy across '+pst.n+' trades.</b> Encouraging \u2014 though paper results '+
+        'flatter reality: real fills slip, and real hands hesitate.</div>';
+    }
+    h+='</div></div>';
   }
 
   if(st){
@@ -3217,7 +3764,9 @@ function journalPane(){
       h+='</div></div>';
     }
 
-    h+='<div class="levels"><div class="hd">'+(open?"Open position":"Closed")+'</div>'+
+    h+='<div class="levels"><div class="hd">'+
+      (t.paper?"\ud83e\uddea Paper \u00b7 ":"")+(open?"Running":"Resolved")+
+      (open&&t.paper?" (auto)":"")+'</div>'+
       '<div class="lvl"><span class="lbl">Entry</span><span>'+px(t.entry)+'</span></div>';
     if(open){
       h+='<div class="lvl"><span class="lbl">Now</span><span class="mono" data-live="'+lk2+
@@ -3235,6 +3784,24 @@ function journalPane(){
     }
     h+='</div>';
 
+    if(!open) h+=postMortemHTML(t);
+    if(t.paper&&t.events&&t.events.length){
+      h+='<div class="factors"><div class="hd"><span>What happened</span><span>'+
+        (t.remaining>0.001?(t.remaining*100).toFixed(0)+"% still held":"fully closed")+'</span></div>';
+      t.events.forEach(function(ev){
+        var c=ev.kind==="stop"?"var(--red)":ev.kind==="tp"?"var(--frog)":"var(--dim)";
+        var ic=ev.kind==="stop"?"\u2715":ev.kind==="tp"?"\u2713":"\u25cf";
+        h+='<div class="chk"><span class="ic" style="color:'+c+'">'+ic+'</span>'+
+           '<span class="tx" style="color:'+(ev.kind==="done"?"var(--dim)":c)+'">'+esc(ev.note)+'</span>'+
+           '<span class="vl">'+new Date(ev.at).toLocaleTimeString()+'</span></div>';
+      });
+      h+='</div>';
+    }
+    if(t.paper&&open&&t.peak>1){
+      h+='<div style="margin-top:10px;font-size:13.5px;color:var(--dim)">Peak so far: '+
+        t.peak.toFixed(2)+'x</div>';
+    }
+
     // Contract address, copyable — you need it to find the position again
     // in your wallet or on a chart, and typing it out is error-prone.
     h+='<div class="ca"><code>'+esc(t.addr||"(no address saved)")+'</code>'+
@@ -3250,7 +3817,17 @@ function journalPane(){
          '<a href="https://x.com/search?q='+encodeURIComponent(t.addr)+'&f=live" target="_blank" rel="noopener">X \u2197</a></div>';
     }
 
-    if(open){
+    if(open&&t.paper){
+      h+='<div style="margin-top:12px;padding:12px;border-radius:9px;background:var(--panel);'+
+        'border:1px solid var(--line);font-size:13.5px;line-height:1.6;color:var(--text2)">'+
+        'This one is running on its own. It sells '+
+        (t.tps.slice().sort(function(a,b){return a-b;}).map(function(m,i){
+          return (i===0?"50%":"25%")+" at "+m+"x";}).join(", "))+
+        ', or exits everything if it falls '+t.stopPct+'%. Keep the app open so prices update.</div>'+
+        '<div class="toolbar" style="padding:11px 0 0;border:none">'+
+        '<button data-del="'+esc(t.id)+'">Remove</button></div>';
+    }
+    if(open&&!t.paper){
       // What the app recorded is the scan price; what you actually paid may
       // differ after slippage. Correcting it fixes every downstream number.
       h+='<div class="field" style="padding:14px 0 0"><label>What you actually paid</label>'+
@@ -3557,6 +4134,17 @@ var LEARN=[
   {q:"Why 'unverified' is not 'safe'", a:"Security providers index new contracts on a delay, so anything a few hours old often has no record at all. RibbitPad shows these separately rather than hiding or approving them.<br><br>Unverified means nobody has checked it \u2014 the riskiest category, and also where the biggest moves start. Both are true at once."}
 ];
 
+// Maps a metric label to its Learn entry so a beginner can tap any term
+// where they meet it rather than hunting for a glossary.
+var LEARN_INDEX={};
+(function(){ LEARN.forEach(function(x,i){ LEARN_INDEX[x.q.toLowerCase()]=i; }); })();
+function learnLink(label,topic){
+  var i=LEARN_INDEX[(topic||label).toLowerCase()];
+  if(i==null)return esc(label);
+  return '<span data-learnjump="'+i+'" style="border-bottom:1px dotted var(--dim);cursor:pointer">'+
+    esc(label)+'</span>';
+}
+
 function learnHTML(){
   var h='<div class="banner info"><b>Learn the terms</b><br><br>'+
     'Every metric this app uses, explained plainly \u2014 including what each one '+
@@ -3647,6 +4235,10 @@ function cfgPane(){
   '<div class="hint">Minimum 3. Faster is not necessarily better \u2014 the underlying data updates '+
   'roughly every few seconds anyway, and tighter polling risks hitting the free rate limit.</div></div>'+
 
+  '<div class="field"><label>Simulated wallet starting balance</label><input id="cStart" type="number" inputmode="decimal" value="'+c.startBalance+'" />'+
+  '<div class="hint">What the paper wallet begins with. At '+usd(c.sizeUsd)+' per trade that is '+
+  Math.floor(c.startBalance/Math.max(c.sizeUsd,1))+' positions before it is fully deployed.</div></div>'+
+
   '<div class="field"><label>Heat threshold</label><input id="cHeat" type="number" inputmode="decimal" value="'+c.heatThreshold+'" />'+
   '<div class="hint">Minimum build score for the Heat tab (0\u2013100). Lower shows more, earlier and noisier; higher shows only strong build-ups.</div></div>'+
 
@@ -3734,6 +4326,12 @@ function render(){
   if(ol)ol.onclick=function(){S.showLearn=true;render();};
   var bs=document.getElementById("backSettings");
   if(bs)bs.onclick=function(){S.showLearn=false;render();};
+  Array.prototype.forEach.call(app.querySelectorAll("[data-learnjump]"),function(b){
+    b.onclick=function(){
+      var i=b.getAttribute("data-learnjump");
+      S.learnOpen={}; S.learnOpen[i]=true;
+      S.showLearn=true; S.tab="cfg"; render();
+    };});
   Array.prototype.forEach.call(app.querySelectorAll("[data-learn]"),function(b){
     b.onclick=function(){var i=b.getAttribute("data-learn");
       S.learnOpen[i]=!S.learnOpen[i];render();};});
@@ -3766,6 +4364,10 @@ function render(){
   if(wt)wt.onclick=function(){S.watching?stopWatching():startWatching();};
   var nb=document.getElementById("notifBtn");if(nb)nb.onclick=requestNotify;
   var tc=document.getElementById("trCsv");if(tc)tc.onclick=exportTradesCSV;
+  var ss=document.getElementById("showStats");
+  if(ss)ss.onclick=function(){S.showStats=true;render();};
+  var bj=document.getElementById("backJournal");
+  if(bj)bj.onclick=function(){S.showStats=false;render();};
   Array.prototype.forEach.call(app.querySelectorAll("[data-log]"),function(b){
     b.onclick=function(){
       S.logPrompt={addr:b.getAttribute("data-log")};
@@ -3773,6 +4375,12 @@ function render(){
     };});
   Array.prototype.forEach.call(app.querySelectorAll("[data-logcancel]"),function(b){
     b.onclick=function(){S.logPrompt=null;render();};});
+  Array.prototype.forEach.call(app.querySelectorAll("[data-logmode]"),function(b){
+    b.onclick=function(){
+      if(!S.logPrompt)return;
+      S.logPrompt.real=(b.getAttribute("data-logmode")==="real");
+      render();
+    };});
   Array.prototype.forEach.call(app.querySelectorAll("[data-logconfirm]"),function(b){
     b.onclick=function(){
       var addr=b.getAttribute("data-logconfirm");
@@ -3797,10 +4405,13 @@ function render(){
       for(var i=0;i<pool.length;i++){
         var p=pool[i];
         if(((p.baseToken&&p.baseToken.address)||"")===addr){
-          logTrade(p,pv,sv);
+          var isReal=!!(S.logPrompt&&S.logPrompt.real);
+          logTrade(p,pv,sv,!isReal);
           S.logPrompt=null;
-          S.journalNote="Logged "+((p.baseToken&&p.baseToken.symbol)||"trade")+" at "+px(pv)+
-            " for "+usd(sv)+". Open the Log tab to track it.";
+          S.journalNote=(isReal?"Logged ":"Paper trade started on ")+
+            ((p.baseToken&&p.baseToken.symbol)||"trade")+" at "+px(pv)+" for "+usd(sv)+
+            (isReal?". Open the Log tab to track it."
+                  :". It will sell at your targets and exit at your stop automatically \u2014 check the Log tab.");
           render();
           return;
         }
@@ -3891,6 +4502,7 @@ function render(){
     c.maxExposureUsd=Math.max(1,gv("cMaxExp",c.maxExposureUsd,1));
     c.dailyLossLimit=Math.max(1,gv("cDayLoss",c.dailyLossLimit,1));
     c.heatThreshold=Math.max(0,Math.min(100,gv("cHeat",c.heatThreshold,0)));
+    c.startBalance=Math.max(1,gv("cStart",c.startBalance,1));
     c.liveIntervalSec=Math.max(3,gv("cLiveSec",c.liveIntervalSec,3));
     c.freshMinAgeH=gv("cFreshMin",c.freshMinAgeH);
     c.freshMaxAgeH=Math.max(1,gv("cFreshMax",c.freshMaxAgeH,1));
