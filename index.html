@@ -2342,35 +2342,7 @@ function cardHTML(p,isBlocked){
   if(!isBlocked) h+=socialHTML(p);
   if(!isBlocked&&cv&&(g.verdict==="pass"||g.verdict==="caution")) h+=buyPlanHTML(p);
   h+='<div class="ca"><code>'+esc(addr)+'</code><button data-copy="'+esc(addr)+'">Copy</button></div>';
-  if(!isBlocked&&cv){
-    if(S.logPrompt&&S.logPrompt.addr===addr){
-      // Confirm the real fill before recording. The scan price is what the
-      // token cost when it was found, not what your wallet actually paid.
-      var liveNow=(LIVE.prices[liveKey(p.chainId,addr)]||{}).px||num(p.priceUsd);
-      h+='<div style="margin-top:12px;border:1.5px solid var(--frog);border-radius:11px;overflow:hidden">'+
-        '<div style="padding:12px 14px;background:#0D2109;font-size:13.5px;font-weight:800;color:var(--frog)">'+
-        'What did you actually pay?</div>'+
-        '<div style="padding:14px">'+
-        '<div class="row2">'+
-        '<div><label style="display:block;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;'+
-          'color:var(--dim);font-weight:700;margin-bottom:7px">Price you paid</label>'+
-          '<input id="logPx" inputmode="decimal" value="'+esc(String(liveNow))+'" /></div>'+
-        '<div><label style="display:block;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;'+
-          'color:var(--dim);font-weight:700;margin-bottom:7px">Amount spent</label>'+
-          '<input id="logSize" inputmode="decimal" value="'+esc(String(S.cfg.sizeUsd))+'" /></div>'+
-        '</div>'+
-        '<div class="hint" style="margin-top:9px">Live price is '+px(liveNow)+
-        '. Enter what your wallet actually filled at \u2014 slippage usually makes it a little different, '+
-        'and your stop, targets and P&amp;L are all calculated from this number.</div>'+
-        '<div class="toolbar" style="padding:12px 0 0;border:none">'+
-        '<button class="primary" data-logconfirm="'+esc(addr)+'">Confirm &amp; log</button>'+
-        '<button data-logcancel="1">Cancel</button></div>'+
-        '</div></div>';
-    } else {
-      h+='<div class="toolbar" style="padding:11px 0 0;border:none">'+
-         '<button class="primary" data-log="'+esc(addr)+'">\u270e Log this trade</button></div>';
-    }
-  }
+  if(!isBlocked&&cv) h+=logButtonHTML(p,addr);
   var links='';
   links+='<a href="'+esc(definedUrl(p))+'" target="_blank" rel="noopener" '+
     'style="color:var(--frog);border-color:rgba(110,232,90,.45)">Defined ↗</a>';
@@ -2592,6 +2564,35 @@ function dumpRiskHTML(p){
   return h+'</div>';
 }
 
+// Log button + its confirmation form. Shared so the Top Picks cards and the
+// regular list behave identically — previously only the list rendered the
+// form, so tapping Log on a top pick appeared to do nothing.
+function logButtonHTML(p,addr){
+  if(!(S.logPrompt&&S.logPrompt.addr===addr)){
+    return '<div class="toolbar" style="padding:11px 0 0;border:none">'+
+      '<button class="primary" data-log="'+esc(addr)+'">\u270e Log this trade</button></div>';
+  }
+  var liveNow=(LIVE.prices[liveKey(p.chainId,addr)]||{}).px||num(p.priceUsd);
+  return '<div style="margin-top:12px;border:2px solid var(--frog);border-radius:11px;overflow:hidden">'+
+    '<div style="padding:12px 14px;background:#0D2109;font-size:14px;font-weight:800;color:var(--frog)">'+
+    'What did you actually pay?</div>'+
+    '<div style="padding:14px">'+
+    '<div class="row2">'+
+    '<div><label style="display:block;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;'+
+      'color:var(--dim);font-weight:700;margin-bottom:7px">Price you paid</label>'+
+      '<input class="logPxIn" data-px="'+esc(addr)+'" inputmode="decimal" value="'+esc(String(liveNow))+'" /></div>'+
+    '<div><label style="display:block;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;'+
+      'color:var(--dim);font-weight:700;margin-bottom:7px">Amount spent</label>'+
+      '<input class="logSzIn" data-sz="'+esc(addr)+'" inputmode="decimal" value="'+esc(String(S.cfg.sizeUsd))+'" /></div>'+
+    '</div>'+
+    '<div class="hint" style="margin-top:9px">Live price is '+px(liveNow)+
+    '. Enter what your wallet actually filled at \u2014 your stop, targets and P&amp;L all come from this.</div>'+
+    '<div class="toolbar" style="padding:12px 0 0;border:none">'+
+    '<button class="primary" data-logconfirm="'+esc(addr)+'">Confirm &amp; log</button>'+
+    '<button data-logcancel="1">Cancel</button></div>'+
+    '</div></div>';
+}
+
 function buyPlanHTML(p){
   var cv=p._cv, econ=p._econ;
   if(!cv||!econ)return "";
@@ -2680,8 +2681,8 @@ function topPicksHTML(list){
         '</div></div>';
     }
     h+=buyPlanHTML(p);
+    h+=logButtonHTML(p,(p.baseToken&&p.baseToken.address)||"");
     h+='<div class="toolbar" style="padding:11px 0 0;border:none">'+
-       '<button class="primary" data-log="'+esc((p.baseToken&&p.baseToken.address)||"")+'">\u270e Log this trade</button>'+
        '<button data-copy="'+esc((p.baseToken&&p.baseToken.address)||"")+'">Copy address</button></div>';
     h+='</div>';
   });
@@ -3775,8 +3776,19 @@ function render(){
   Array.prototype.forEach.call(app.querySelectorAll("[data-logconfirm]"),function(b){
     b.onclick=function(){
       var addr=b.getAttribute("data-logconfirm");
-      var pxEl=document.getElementById("logPx"), szEl=document.getElementById("logSize");
+      // Scope the inputs to this address: the same token can appear in both
+      // Top Picks and the list, so a shared element id would be ambiguous.
+      var pxEl=app.querySelector('.logPxIn[data-px="'+addr+'"]');
+      var szEl=app.querySelector('.logSzIn[data-sz="'+addr+'"]');
       var pv=pxEl?parseFloat(pxEl.value):NaN, sv=szEl?parseFloat(szEl.value):NaN;
+      // If the field somehow isn't reachable, fall back to the live price
+      // rather than refusing to record the trade.
+      if(!isFinite(pv)||pv<=0){
+        var lp=(LIVE.prices[Object.keys(LIVE.prices).filter(function(k){
+          return k.indexOf(":"+addr.toLowerCase())>0;})[0]]||{}).px;
+        if(lp)pv=lp;
+      }
+      if(!isFinite(sv)||sv<=0) sv=S.cfg.sizeUsd;
       if(!isFinite(pv)||pv<=0){S.journalNote="Enter the price you paid \u2014 it can't be blank or zero.";render();return;}
       if(!isFinite(sv)||sv<=0){S.journalNote="Enter how much you spent.";render();return;}
       var pool=S.passed.concat(S.unverified,S.heat,S.heatUnverified,S.fresh,S.freshUnverified);
