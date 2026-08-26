@@ -443,7 +443,33 @@ function saveWatch(){ if(LS_OK){try{
 function saveHunts(){ if(LS_OK){try{localStorage.setItem("rp:hunts",JSON.stringify(S.hunts));}catch(e){}} }
 function loadHunts(){ if(!LS_OK)return;
   try{var x=localStorage.getItem("rp:hunts"); if(x){var p=JSON.parse(x);S.hunts=Array.isArray(p)?p:[];}}catch(e){S.hunts=[];} }
-function saveTrades(){ if(LS_OK){try{localStorage.setItem("rp:trades",JSON.stringify(S.trades));}catch(e){}} }
+// The trade log is the one thing here that cannot be regenerated, so a failed
+// save must never pass silently. If storage is full, shed the disposable
+// caches first (snapshots, shadow tracking, audits) and retry — and if it
+// still fails, say so loudly rather than quietly losing your history.
+function saveTrades(){
+  invalidateWeights();
+  if(!LS_OK)return;
+  try{
+    localStorage.setItem("rp:trades",JSON.stringify(S.trades));
+    S.storageError=null;
+  }catch(e){
+    var freed=0;
+    try{
+      Object.keys(localStorage).forEach(function(k){
+        if(k.indexOf("rp:s:")===0||k.indexOf("rp:a:")===0){localStorage.removeItem(k);freed++;}
+      });
+      localStorage.removeItem("rp:shadow");
+    }catch(e2){}
+    try{
+      localStorage.setItem("rp:trades",JSON.stringify(S.trades));
+      S.storageError=null;
+    }catch(e3){
+      S.storageError="Your browser storage is full, so the trade log could not be saved. "+
+        "Export your trades to CSV now to avoid losing them, then remove some closed trades.";
+    }
+  }
+}
 function loadTrades(){
   if(!LS_OK)return;
   try{var t=localStorage.getItem("rp:trades"); if(t){var pt=JSON.parse(t);S.trades=Array.isArray(pt)?pt:[];}}catch(e){S.trades=[];}
@@ -478,7 +504,7 @@ var S={
     strict:true, requireLpLock:true, hideBlocked:false, minGrade:"B-",
     auditLimit:100,        // how many candidates to deep-audit per scan
     freshMaxAgeH:48, freshMinAgeH:0.5, freshMinLiq:5000, freshSortBySurge:true,
-    maxOpenPositions:5, maxExposureUsd:50, dailyLossLimit:20, maxCreatorPct:10, seenIntro:false, heatThreshold:35, startBalance:100, personalise:true, liveEnabled:true, liveIntervalSec:5
+    maxOpenPositions:5, maxExposureUsd:50, dailyLossLimit:20, maxCreatorPct:10, seenIntro:false, heatThreshold:35, startBalance:100, personalise:true, adaptWeights:true, liveEnabled:true, liveIntervalSec:5
   },
   coverage:null,           // {found, chains, screened, audited} for transparency
   fresh:[], freshBlocked:[], freshUnverified:[], freshLoading:false, freshErr:null, freshCoverage:null,
@@ -486,7 +512,7 @@ var S={
   watch:[], watchData:{}, watchLoading:false, watchErr:null, watchInput:"",
   wallets:[], walletInput:"",
   trades:[], tradesLoading:false, journalNote:null, expanded:{}, seenIntro:false,
-  showLearn:false, learnOpen:{}, logPrompt:null, showStats:false,
+  showLearn:false, learnOpen:{}, logPrompt:null, showStats:false, storageError:null,
   watching:false, watchTimer:null, alerts:[], notifOk:false
 };
 
@@ -974,7 +1000,11 @@ function conviction(p,sec,econ){
   else if(age<336)f.matur=Math.max(45,92-((age-120)/216)*47);
   else f.matur=40;
 
-  var total=0;FACTORS.forEach(function(F){total+=f[F.k]*F.w;});
+  // Weights come from the adaptive model once there's enough data, otherwise
+  // they're the shipped defaults.
+  var AW=currentWeights();
+  var WT=(AW&&AW.ready)?AW.weights:null;
+  var total=0;FACTORS.forEach(function(F){total+=f[F.k]*(WT?WT[F.k]:F.w);});
 
   // ---- Hard caps. Some patterns are disqualifying no matter how good the
   // rest of the numbers look, so they cap the grade rather than being
@@ -1069,6 +1099,7 @@ function thesis(cv,econ){
     liq:"liquidity is shallow versus its valuation",turn:"volume is light for the pool size",
     flow:"sellers outweighing buyers",room:"valuation already large, limiting upside",
     dist:"supply concentrated in few wallets",matur:"outside the typical age window"};
+  var AWc=currentWeights(); var WTc=(AWc&&AWc.ready)?AWc.weights:null;
   FACTORS.forEach(function(F){
     if(f[F.k]>=72)ups.push(pos[F.k]); else if(f[F.k]<=38)downs.push(neg[F.k]);
   });
@@ -1235,7 +1266,13 @@ function runScan(){
       } else { p._sec=sec; }
       p._econ=tradeEconomics(p,p._sec);
       p._gate=gate(p,p._sec,p._econ);
-      if(p._gate.verdict==="block")S.blocked.push(p);
+      if(p._gate.verdict==="block"){
+          // Score blocked tokens too, so they can be paper-tested. The score
+          // is never used for ranking — only for the fingerprint if you log
+          // one to check whether the filter was right to reject it.
+          p._cv=conviction(p,p._sec,p._econ);
+          S.blocked.push(p);
+        }
       else{p._cv=conviction(p,p._sec,p._econ);S.passed.push(p);}
       done++;
       S.pct=Math.round((done/list.length)*100);
@@ -1538,6 +1575,7 @@ function logTrade(p,entryOverride,sizeOverride,paperMode){
     pair:p.pairAddress||"",
     sym:(p.baseToken&&p.baseToken.symbol)||"?",
     paper:(paperMode!==false),
+    blockedTest:!!(p._gate&&(p._gate.verdict==="block"||p._gate.verdict==="unverified")),
     remaining:1,
     // Fingerprint captured at entry, never afterwards. Recording what the
     // token looked like when you decided is the only way to learn anything
@@ -1942,6 +1980,50 @@ function learnFindings(){
   return {ready:true,total:b.total,findings:out,buckets:b};
 }
 
+// Did rejecting these tokens actually help? Compares the paper-tested
+// rejects against the ones that passed. This is the app grading itself.
+function filterAuditHTML(){
+  var closed=S.trades.filter(function(t){return t.status==="closed"&&isFinite(t.pnl);});
+  var blocked=closed.filter(function(t){return t.blockedTest;});
+  var passed=closed.filter(function(t){return !t.blockedTest;});
+  if(blocked.length<3)
+    return '<div class="banner info"><b>Is the filter right?</b><br><br>'+
+      'When a token is blocked you can still paper-test it. Do that a few times and this compares '+
+      'how the rejects performed against the ones that passed \u2014 it tells you whether the filter '+
+      'is protecting you or costing you.<br><br>'+
+      blocked.length+' rejected token'+(blocked.length===1?"":"s")+' tested so far. Needs 3.</div>';
+
+  function avg(a){return a.length?a.reduce(function(x,t){return x+(t.size>0?t.pnl/t.size:0);},0)/a.length:0;}
+  var bAvg=avg(blocked), pAvg=avg(passed);
+  var bWin=blocked.filter(function(t){return t.pnl>0;}).length;
+  var pWin=passed.filter(function(t){return t.pnl>0;}).length;
+  var filterHelping=pAvg>bAvg;
+
+  return '<div style="margin:16px 18px;border:1.5px solid '+(filterHelping?"var(--frog)":"var(--amber)")+
+    ';border-radius:12px;overflow:hidden">'+
+    '<div style="padding:13px 14px;background:rgba(255,255,255,.03);font-size:12.5px;text-transform:uppercase;'+
+    'letter-spacing:.09em;font-weight:800;color:'+(filterHelping?"var(--frog)":"var(--amber)")+'">'+
+    'Is the filter right?</div><div style="padding:14px">'+
+    '<div class="fac" style="padding-left:0;padding-right:0"><span class="fl">Tokens it passed</span>'+
+      '<span class="fw">'+pWin+'/'+passed.length+' won</span>'+
+      '<span class="fv" style="color:'+(pAvg>=0?"var(--frog)":"var(--red)")+';width:auto">'+
+      (pAvg>=0?"+":"")+(pAvg*100).toFixed(0)+'% avg</span></div>'+
+    '<div class="fac" style="padding-left:0;padding-right:0;border-bottom:none"><span class="fl">Tokens it rejected</span>'+
+      '<span class="fw">'+bWin+'/'+blocked.length+' won</span>'+
+      '<span class="fv" style="color:'+(bAvg>=0?"var(--frog)":"var(--red)")+';width:auto">'+
+      (bAvg>=0?"+":"")+(bAvg*100).toFixed(0)+'% avg</span></div>'+
+    '<div style="margin-top:12px;font-size:14.5px;line-height:1.7;color:var(--text2)">'+
+    (filterHelping
+      ? '<b style="color:var(--frog)">The filter is earning its keep.</b> Tokens it rejected did worse '+
+        'than the ones it passed, which is exactly what you want from it.'
+      : '<b style="color:var(--amber)">The filter may be too strict.</b> On this sample the rejects did '+
+        'as well or better. Worth loosening Strict mode or the liquidity-lock requirement \u2014 though '+
+        'with '+blocked.length+' tested this could easily be chance.')+
+    '<br><br><span style="color:var(--dim);font-size:13px">Note that rejects which were genuine honeypots '+
+    'cannot be measured properly here: the simulation lets you sell, whereas in reality you could not. '+
+    'So this comparison flatters the rejects.</span></div></div></div>';
+}
+
 function learnPanelHTML(){
   var b=learnBuckets();
   if(!b) return '<div class="banner info"><b>Nothing to learn from yet.</b><br><br>'+
@@ -2237,26 +2319,297 @@ var FIT_K=6;              // shrinkage constant
 var FIT_MAX=14;           // most points fit can add or remove
 var FIT_MIN_TRADES=12;    // below this, personalisation stays off
 
+// ===========================================================================
+// ADAPTIVE FACTOR WEIGHTS
+//
+// The eight factors that make up a grade ship with weights I chose. Those are
+// a prior, not truth. This measures how each factor's score at ENTRY actually
+// correlated with the return you got, and shifts the weights toward whatever
+// has been predictive for you.
+//
+// Two safeguards, because this is where a learning system can most easily
+// fool itself:
+//   1. The blend toward learned weights scales with sample size and never
+//      exceeds 60% — my priors always retain a say, so one odd stretch of
+//      trades cannot rewrite the grader.
+//   2. Correlations are computed on entry-time values only, and the whole
+//      thing is inert below WEIGHT_MIN_N trades.
+// ===========================================================================
+var WEIGHT_MIN_N=25;
+var WEIGHT_MAX_BLEND=0.60;
+
+// Market conditions change. A trade from three months ago should not carry
+// the same weight as one from last week, so everything the models learn is
+// discounted with a half-life: at 45 days old a trade counts half as much,
+// at 90 days a quarter. Old data still contributes — it just stops dominating.
+var RECENCY_HALFLIFE_DAYS=45;
+function recencyWeight(t){
+  var when=t.exitAt||t.opened||Date.now();
+  var days=(Date.now()-when)/86400000;
+  if(!(days>0))return 1;
+  return Math.pow(0.5,days/RECENCY_HALFLIFE_DAYS);
+}
+
+function adaptiveWeights(){
+  var closed=S.trades.filter(function(t){
+    return t.status==="closed"&&t.fp&&isFinite(t.pnl)&&t.size>0&&!t.blockedTest;
+  });
+  var base={};
+  FACTORS.forEach(function(f){base[f.k]=f.w;});
+  if(closed.length<WEIGHT_MIN_N)
+    return {ready:false,n:closed.length,weights:base,base:base,blend:0,corr:null};
+
+  var rows=closed.map(function(t){
+    return {r:t.pnl/t.size, f:t.fp, w:recencyWeight(t)};
+  });
+  var keys=["accel","turn","room","flow","liq","dist"];
+  var fpMap={accel:"accel",turn:"turn",room:"room",flow:"flow",liq:"liqF",dist:"dist"};
+
+  var wSum=rows.reduce(function(a,x){return a+x.w;},0)||1;
+  var meanR=rows.reduce(function(a,x){return a+x.r*x.w;},0)/wSum;
+  var corr={};
+  keys.forEach(function(k){
+    var fk=fpMap[k];
+    var vals=rows.map(function(x){return num(x.f[fk]);});
+    var meanV=rows.reduce(function(a,x,i){return a+vals[i]*x.w;},0)/wSum;
+    var num1=0,dv=0,dr=0;
+    rows.forEach(function(x,i){
+      var a=vals[i]-meanV, b=x.r-meanR;
+      num1+=a*b*x.w; dv+=a*a*x.w; dr+=b*b*x.w;
+    });
+    var c=(dv>0&&dr>0)?num1/Math.sqrt(dv*dr):0;
+    corr[k]=isFinite(c)?c:0;
+  });
+
+  // Turn correlations into positive weights. A factor that correlated
+  // negatively gets pushed down, never below a floor — no factor is deleted
+  // outright on the strength of a few dozen trades.
+  var learned={},sum=0;
+  FACTORS.forEach(function(f){
+    var c=corr[f.k];
+    var w=(c==null)?f.w:f.w*(1+Math.max(-0.8,Math.min(1.2,c*1.6)));
+    w=Math.max(f.w*0.25,w);
+    learned[f.k]=w; sum+=w;
+  });
+  Object.keys(learned).forEach(function(k){learned[k]=learned[k]/sum;});
+
+  // blend grows with n, capped
+  var blend=Math.min(WEIGHT_MAX_BLEND,(closed.length-WEIGHT_MIN_N)/60+0.2);
+  var out={},osum=0;
+  FACTORS.forEach(function(f){
+    var w=base[f.k]*(1-blend)+learned[f.k]*blend;
+    out[f.k]=w; osum+=w;
+  });
+  Object.keys(out).forEach(function(k){out[k]=out[k]/osum;});
+
+  return {ready:true,n:closed.length,weights:out,base:base,learned:learned,blend:blend,corr:corr};
+}
+
+// Cached per render so conviction() doesn't recompute it for every token.
+var AW_CACHE={at:0,val:null};
+function currentWeights(){
+  if(!S.cfg.adaptWeights)return null;
+  if(Date.now()-AW_CACHE.at<4000&&AW_CACHE.val)return AW_CACHE.val;
+  AW_CACHE={at:Date.now(),val:adaptiveWeights()};
+  return AW_CACHE.val;
+}
+function invalidateWeights(){AW_CACHE={at:0,val:null};}
+
+function weightsPanelHTML(){
+  var aw=adaptiveWeights();
+  if(!aw.ready)
+    return '<div class="banner warn"><b>\u2699\ufe0f Adaptive grading waiting for data</b><br><br>'+
+      aw.n+' of '+WEIGHT_MIN_N+' resolved trades. Once there are enough, the eight factors behind '+
+      'every grade start reweighting toward whichever ones actually predicted your results.</div>';
+
+  var rows=FACTORS.slice().map(function(f){
+    return {k:f.k,n:f.n,base:aw.base[f.k],now:aw.weights[f.k],c:aw.corr[f.k]||0};
+  }).sort(function(a,b){return b.now-a.now;});
+
+  var h='<div class="banner info" style="border-color:var(--frog)"><b>\u2699\ufe0f Adaptive grading is on</b><br><br>'+
+    'Grades are now weighted using '+aw.n+' of your resolved trades \u2014 '+
+    (aw.blend*100).toFixed(0)+'% learned, '+((1-aw.blend)*100).toFixed(0)+'% original. '+
+    'Factors that predicted your winners count for more.</div>';
+
+  h+='<div class="factors" style="margin:0 18px 12px"><div class="hd"><span>Factor weights</span>'+
+    '<span>was \u2192 now</span></div>';
+  rows.forEach(function(r){
+    var up=r.now>r.base+0.005, down=r.now<r.base-0.005;
+    var col=up?"var(--frog)":down?"var(--red)":"var(--text2)";
+    h+='<div class="fac"><span class="fl">'+esc(r.n)+'</span>'+
+      '<span class="fw" style="color:var(--dim)">r='+r.c.toFixed(2)+'</span>'+
+      '<span class="fv" style="color:'+col+';width:auto">'+(r.base*100).toFixed(0)+'% \u2192 '+
+      (r.now*100).toFixed(0)+'%</span></div>';
+  });
+  h+='</div>';
+
+  h+='<div class="banner warn"><b>How to read this.</b> <span style="font-family:var(--mono)">r</span> is '+
+    'the correlation between that factor\u2019s score at entry and what the trade returned, from '+
+    '\u22121 to +1. Values near zero mean the factor told you nothing. Even a strong-looking value '+
+    'can be coincidence at this sample size, which is why the blend is capped at '+
+    (WEIGHT_MAX_BLEND*100).toFixed(0)+'% \u2014 the original weights always keep a say, so one unusual '+
+    'stretch cannot rewrite the grader.</div>';
+  return h;
+}
+
+// ===========================================================================
+// EXIT LADDER BACKTEST
+//
+// Every resolved paper trade records the highest multiple it reached before
+// finishing. That is enough to replay the same trades under a different exit
+// plan and see what each would have produced. It answers "should I take 5x or
+// hold for 10x" with your own results instead of a guess.
+//
+// The honest limit: peak is the best price reached between price checks, so
+// a spike between updates may be missed, and every ladder is credited with
+// filling exactly at its rungs. It compares plans fairly against each other;
+// it does not promise those exact numbers.
+// ===========================================================================
+var LADDERS=[
+  {name:"2x / 3x / 5x",     tp:[2,3,5],    note:"very conservative"},
+  {name:"2x / 4x / 6x",     tp:[2,4,6],    note:"conservative"},
+  {name:"2x / 4x / 10x",    tp:[2,4,10],   note:"balanced (default)"},
+  {name:"3x / 6x / 15x",    tp:[3,6,15],   note:"patient"},
+  {name:"2x / 5x / 25x",    tp:[2,5,25],   note:"lottery tail"},
+  {name:"all at 2x",        tp:[2],        note:"take the double, done"},
+  {name:"all at 3x",        tp:[3],        note:"single exit"}
+];
+
+// Replay one trade under a given ladder using its recorded peak.
+function replayLadder(t,tp){
+  if(!t.entry||!isFinite(t.peak)||t.peak<=0)return null;
+  var peak=t.peak;
+  var stopMult=1-(t.stopPct/100);
+  var steps=tp.slice().sort(function(a,b){return a-b;});
+  var remaining=1, proceeds=0;
+
+  steps.forEach(function(m,idx){
+    if(peak<m)return;
+    var isLast=idx===steps.length-1;
+    var frac=isLast?remaining:(idx===0?remaining*0.5:remaining*0.25);
+    if(frac<=0)return;
+    proceeds+=t.size*frac*m;
+    remaining-=frac;
+  });
+
+  // Whatever is left is assumed to come back down to the stop. This is the
+  // pessimistic assumption and it is deliberate: a plan should not be
+  // credited for a runner that merely might have kept going.
+  if(remaining>0.001) proceeds+=t.size*remaining*stopMult;
+
+  return proceeds-t.size-(t.costs||0);
+}
+
+function ladderBacktest(){
+  var closed=S.trades.filter(function(t){
+    return t.status==="closed"&&isFinite(t.peak)&&t.peak>0&&t.size>0;
+  });
+  if(closed.length<8)return {ready:false,n:closed.length};
+
+  var results=LADDERS.map(function(L){
+    var total=0,wins=0,n=0;
+    closed.forEach(function(t){
+      var p=replayLadder(t,L.tp);
+      if(p==null)return;
+      total+=p; n++; if(p>0)wins++;
+    });
+    return {name:L.name,note:L.note,tp:L.tp,total:total,n:n,
+      exp:n?total/n:0, winRate:n?(wins/n)*100:0};
+  }).filter(function(r){return r.n>0;});
+
+  results.sort(function(a,b){return b.total-a.total;});
+  var curKey=S.cfg.tp.slice().sort(function(a,b){return a-b;}).join(",");
+  var current=results.filter(function(r){
+    return r.tp.slice().sort(function(a,b){return a-b;}).join(",")===curKey;
+  })[0]||null;
+
+  // how often each level was actually reached
+  var reach={};
+  [1.5,2,3,4,5,6,10,15,25].forEach(function(m){
+    reach[m]=closed.filter(function(t){return t.peak>=m;}).length;
+  });
+
+  return {ready:true,n:closed.length,results:results,current:current,reach:reach,total:closed.length};
+}
+
+function ladderPanelHTML(){
+  var b=ladderBacktest();
+  if(!b.ready)
+    return '<div class="banner info"><b>Exit plan comparison</b><br><br>'+
+      'Once enough trades resolve, this replays them under different exit ladders and shows which '+
+      'would have made the most \u2014 your own answer to "take profit early or hold for the tail".'+
+      '<br><br>'+b.n+' of 8 resolved trades with peak data.</div>';
+
+  var best=b.results[0];
+  var cur=b.current;
+  var h='<div class="banner info"><b>\ud83e\uddee Exit plan comparison \u2014 '+b.n+' trades replayed</b><br><br>'+
+    'The same trades, run under different exit ladders. Ranked by total profit.</div>';
+
+  h+='<div class="factors" style="margin:0 18px 12px"><div class="hd"><span>Ladder</span><span>total</span></div>';
+  b.results.forEach(function(r,i){
+    var isCur=cur&&r.name===cur.name;
+    var col=r.total>=0?"var(--frog)":"var(--red)";
+    h+='<div class="fac"'+(isCur?' style="background:rgba(110,232,90,.07)"':'')+'>'+
+      '<span class="fl">'+(i===0?"\ud83c\udfc6 ":"")+esc(r.name)+
+      (isCur?' <span style="color:var(--frog);font-size:12px">\u2190 yours</span>':'')+
+      '<br><span style="color:var(--dim);font-size:12px">'+esc(r.note)+'</span></span>'+
+      '<span class="fw">'+r.winRate.toFixed(0)+'%</span>'+
+      '<span class="fv" style="color:'+col+';width:auto">'+(r.total>=0?"+":"")+usd(r.total)+'</span></div>';
+  });
+  h+='</div>';
+
+  // how often each level was hit — the crux of the early/late question
+  h+='<div class="factors" style="margin:0 18px 12px"><div class="hd"><span>How often your trades reached</span>'+
+    '<span>of '+b.total+'</span></div>';
+  [2,3,4,5,6,10,15].forEach(function(m){
+    var c=b.reach[m]||0, pct=(c/b.total)*100;
+    h+='<div class="fac"><span class="fl">'+m+'x or better</span>'+
+      '<span class="fw">'+pct.toFixed(0)+'%</span>'+
+      '<span class="fv" style="width:auto;color:'+(c?"var(--text2)":"var(--dim)")+'">'+c+' trades</span></div>';
+  });
+  h+='</div>';
+
+  if(cur&&best&&best.name!==cur.name){
+    var gain=best.total-cur.total;
+    h+='<div style="margin:0 18px 12px;padding:14px;border-radius:11px;border:1.5px solid var(--amber);'+
+      'background:rgba(255,194,77,.06);font-size:14.5px;line-height:1.7;color:var(--text2)">'+
+      '<b style="color:var(--amber)">'+esc(best.name)+' would have made '+usd(gain)+' more</b> than your '+
+      'current '+esc(cur.name)+' across these '+b.n+' trades.<br><br>'+
+      'Before changing anything: '+b.n+' trades is a small sample, and this is the exact situation where '+
+      'fitting to past results goes wrong. If the difference comes down to one trade that ran to 20x, '+
+      'the "better" ladder is really just that one lucky tail.</div>';
+  } else if(cur){
+    h+='<div style="margin:0 18px 12px;padding:14px;border-radius:11px;border:1.5px solid var(--frog);'+
+      'background:rgba(110,232,90,.06);font-size:14.5px;line-height:1.7;color:var(--text2)">'+
+      '<b style="color:var(--frog)">Your current ladder is the best of these</b> on the trades so far.</div>';
+  }
+
+  h+='<div class="toolbar"><button class="primary" id="applyLadder" data-tp="'+esc(best.tp.join(","))+'">'+
+    'Use '+esc(best.name)+'</button></div>';
+  return h;
+}
+
 function fitModel(){
   var closed=S.trades.filter(function(t){return t.status==="closed"&&t.fp&&isFinite(t.pnl);});
   if(closed.length<FIT_MIN_TRADES)return {ready:false,n:closed.length};
 
   // Normalise P&L to "per dollar staked" so trades of different sizes compare.
   var norm=closed.map(function(t){
-    return {fp:t.fp, r:(t.size>0?t.pnl/t.size:0)};
+    return {fp:t.fp, r:(t.size>0?t.pnl/t.size:0), w:recencyWeight(t)};
   });
-  var overall=norm.reduce(function(a,x){return a+x.r;},0)/norm.length;
+  var wAll=norm.reduce(function(a,x){return a+x.w;},0)||1;
+  var overall=norm.reduce(function(a,x){return a+x.r*x.w;},0)/wAll;
 
   function bucketStats(keyFn){
     var m={};
     norm.forEach(function(x){
       var k=keyFn(x.fp); if(k==null||k==="?")return;
-      m[k]=m[k]||{n:0,sum:0};
-      m[k].n++; m[k].sum+=x.r;
+      m[k]=m[k]||{n:0,sum:0,w:0};
+      m[k].n++; m[k].sum+=x.r*x.w; m[k].w+=x.w;
     });
     var out={};
     Object.keys(m).forEach(function(k){
-      var mean=m[k].sum/m[k].n;
+      var mean=m[k].w>0?m[k].sum/m[k].w:0;
       // difference from your own average, shrunk by sample size
       var edge=(mean-overall)*(m[k].n/(m[k].n+FIT_K));
       out[k]={n:m[k].n,mean:mean,edge:edge};
@@ -3112,11 +3465,13 @@ function cardHTML(p,isBlocked){
     h+='</div>';
   }
 
+  h+=fitHTML(p);
   h+=dumpRiskHTML(p);
   if(!isBlocked) h+=socialHTML(p);
   if(!isBlocked&&cv&&(g.verdict==="pass"||g.verdict==="caution")) h+=buyPlanHTML(p);
   h+='<div class="ca"><code>'+esc(addr)+'</code><button data-copy="'+esc(addr)+'">Copy</button></div>';
   if(!isBlocked&&cv) h+=logButtonHTML(p,addr);
+  else if(cv) h+=blockedLogHTML(p,addr);
   var links='';
   links+='<a href="'+esc(definedUrl(p))+'" target="_blank" rel="noopener" '+
     'style="color:var(--frog);border-color:rgba(110,232,90,.45)">Defined ↗</a>';
@@ -3385,6 +3740,43 @@ function logButtonHTML(p,addr){
       (S.logPrompt.real?"Log real trade":"Start paper trade")+'</button>'+
     '<button data-logcancel="1">Cancel</button></div>'+
     '</div></div>';
+}
+
+// Blocked and unverified tokens can be paper-tested. This is how you find out
+// whether the filter is right: if what it rejects goes on to die, it is earning
+// its keep; if those keep running, it is too strict. Deliberately paper-only —
+// the app will simulate a honeypot, but never help you buy one.
+function blockedLogHTML(p,addr){
+  var g=p._gate||{};
+  var why=g.verdict==="unverified"?"unverifiable":"blocked";
+  if(S.logPrompt&&S.logPrompt.addr===addr){
+    var liveNow=(LIVE.prices[liveKey(p.chainId,addr)]||{}).px||num(p.priceUsd);
+    return '<div style="margin-top:12px;border:2px solid var(--amber);border-radius:11px;overflow:hidden">'+
+      '<div style="padding:12px 14px;background:#181206;font-size:14px;font-weight:800;color:var(--amber)">'+
+      '\ud83e\uddea Paper-test this '+why+' token</div>'+
+      '<div style="padding:14px">'+
+      '<div style="font-size:14px;line-height:1.65;color:var(--text2);margin-bottom:12px">'+
+      'No money involved. This records what would have happened, so you can check whether the '+
+      'filter was right to reject it.</div>'+
+      '<div class="row2">'+
+      '<div><label style="display:block;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;'+
+        'color:var(--dim);font-weight:700;margin-bottom:7px">Price now</label>'+
+        '<input class="logPxIn" data-px="'+esc(addr)+'" inputmode="decimal" value="'+esc(String(liveNow))+'" /></div>'+
+      '<div><label style="display:block;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;'+
+        'color:var(--dim);font-weight:700;margin-bottom:7px">Pretend stake</label>'+
+        '<input class="logSzIn" data-sz="'+esc(addr)+'" inputmode="decimal" value="'+esc(String(S.cfg.sizeUsd))+'" /></div>'+
+      '</div>'+
+      '<div class="toolbar" style="padding:12px 0 0;border:none">'+
+      '<button class="primary" data-logconfirm="'+esc(addr)+'" data-forcepaper="1">Start paper test</button>'+
+      '<button data-logcancel="1">Cancel</button></div>'+
+      '</div></div>';
+  }
+  return '<div class="toolbar" style="padding:11px 0 0;border:none">'+
+    '<button data-log="'+esc(addr)+'" style="border-color:rgba(255,194,77,.45);color:var(--amber)">'+
+    '\ud83e\uddea Paper-test it anyway</button></div>'+
+    '<div style="margin-top:8px;font-size:13px;color:var(--dim);line-height:1.6">'+
+    'Logging rejected tokens teaches the app whether its filters are right. Paper only \u2014 '+
+    'there is no real-money option here.</div>';
 }
 
 function buyPlanHTML(p){
@@ -3791,7 +4183,7 @@ function journalPane(){
 
   if(S.showStats){
     return '<div class="toolbar"><button class="primary" id="backJournal">\u2190 Back to trades</button></div>'+
-      learnPanelHTML()+shadowPanelHTML();
+      ladderPanelHTML()+weightsPanelHTML()+filterAuditHTML()+learnPanelHTML()+shadowPanelHTML();
   }
 
   var openN=S.trades.filter(function(t){return t.status==="open";}).length;
@@ -3908,6 +4300,9 @@ function journalPane(){
       '<div class="empty">No trades logged yet.<br><br>When you buy something, tap <b>Log this trade</b> on its card in Scan, New, or Watch.</div>';
   }
 
+  if(S.storageError)
+    h+='<div class="banner err"><b>\u26a0\ufe0f Trades are not being saved</b><br><br>'+
+      esc(S.storageError)+'</div>';
   h+=walletPanelHTML();
 
   // ---- paper results: the whole point of the dry run ----
@@ -4497,6 +4892,7 @@ function cfgPane(){
   compact(need)+'</b> of liquidity, and anything costing more than <b>'+usd(c.sizeUsd*c.maxFeeDragPct/100)+
   '</b> in total fees gets blocked.</div>'+
 
+  '<div class="tog"><div><div class="t">Adaptive grading</div><div class="s">Reweight the eight grading factors toward whichever ones actually predicted your results. Activates after '+WEIGHT_MIN_N+' resolved trades and is capped at '+(WEIGHT_MAX_BLEND*100).toFixed(0)+'% learned, so the original weights always keep a say.</div></div>'+sw("swAdapt",c.adaptWeights)+'</div>'+
   '<div class="tog"><div><div class="t">Personalised ranking</div><div class="s">Reorder results using your own resolved trades \u2014 tokens like your winners rise, tokens like your losers fall. Activates after '+FIT_MIN_TRADES+' resolved trades. Never affects safety checks.</div></div>'+sw("swPers",c.personalise)+'</div>'+
   '<div class="tog"><div><div class="t">Strict mode</div><div class="s">Block anything unverifiable, not just what fails outright. Unverifiable usually means brand new or deliberately obscured.</div></div>'+sw("swStrict",c.strict)+'</div>'+
   '<div class="tog"><div><div class="t">Require locked liquidity</div><div class="s">Block tokens without 50%+ of LP locked or burned. Unlocked LP is how most rugs happen.</div></div>'+sw("swLp",c.requireLpLock)+'</div>'+
@@ -4680,6 +5076,15 @@ function render(){
   if(wt)wt.onclick=function(){S.watching?stopWatching():startWatching();};
   var nb=document.getElementById("notifBtn");if(nb)nb.onclick=requestNotify;
   var tc=document.getElementById("trCsv");if(tc)tc.onclick=exportTradesCSV;
+  var al=document.getElementById("applyLadder");
+  if(al)al.onclick=function(){
+    var tp=(al.getAttribute("data-tp")||"").split(",").map(Number).filter(function(x){return isFinite(x)&&x>1;});
+    if(!tp.length)return;
+    S.cfg.tp=tp; saveCfg();
+    S.journalNote="Exit ladder set to "+tp.map(function(m){return m+"x";}).join(" / ")+
+      ". This applies to new trades \u2014 open ones keep the plan they started with.";
+    render();
+  };
   var ss=document.getElementById("showStats");
   if(ss)ss.onclick=function(){S.showStats=true;render();};
   var bj=document.getElementById("backJournal");
@@ -4721,7 +5126,9 @@ function render(){
       for(var i=0;i<pool.length;i++){
         var p=pool[i];
         if(((p.baseToken&&p.baseToken.address)||"")===addr){
-          var isReal=!!(S.logPrompt&&S.logPrompt.real);
+          // blocked/unverified tokens are always paper, whatever the toggle says
+          var forced=b.getAttribute("data-forcepaper")==="1";
+          var isReal=!forced&&!!(S.logPrompt&&S.logPrompt.real);
           logTrade(p,pv,sv,!isReal);
           S.logPrompt=null;
           S.journalNote=(isReal?"Logged ":"Paper trade started on ")+
@@ -4803,7 +5210,7 @@ function render(){
 
   function bind(id,k){var el=document.getElementById(id);
     if(el)el.onclick=function(){S.cfg[k]=!S.cfg[k];saveCfg();render();};}
-  bind("swStrict","strict");bind("swLp","requireLpLock");bind("swHide","hideBlocked");bind("swPers","personalise");
+  bind("swStrict","strict");bind("swLp","requireLpLock");bind("swHide","hideBlocked");bind("swPers","personalise");bind("swAdapt","adaptWeights");
   var swL=document.getElementById("swLive");
   if(swL)swL.onclick=function(){S.cfg.liveEnabled=!S.cfg.liveEnabled;saveCfg();restartLive();render();};
 
