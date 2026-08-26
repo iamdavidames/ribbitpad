@@ -478,7 +478,7 @@ var S={
     strict:true, requireLpLock:true, hideBlocked:false, minGrade:"B-",
     auditLimit:100,        // how many candidates to deep-audit per scan
     freshMaxAgeH:48, freshMinAgeH:0.5, freshMinLiq:5000, freshSortBySurge:true,
-    maxOpenPositions:5, maxExposureUsd:50, dailyLossLimit:20, maxCreatorPct:10, seenIntro:false, heatThreshold:35, startBalance:100, liveEnabled:true, liveIntervalSec:5
+    maxOpenPositions:5, maxExposureUsd:50, dailyLossLimit:20, maxCreatorPct:10, seenIntro:false, heatThreshold:35, startBalance:100, personalise:true, liveEnabled:true, liveIntervalSec:5
   },
   coverage:null,           // {found, chains, screened, audited} for transparency
   fresh:[], freshBlocked:[], freshUnverified:[], freshLoading:false, freshErr:null, freshCoverage:null,
@@ -1032,8 +1032,19 @@ function rankAndFilter(list){
   var out=(list||[]).filter(function(p){
     return p&&p._cv&&gradeAtLeast(p._cv.grade,S.cfg.minGrade);
   });
+  // Personalised nudge from your own resolved trades, computed per render.
+  if(S.cfg.personalise){
+    var model=fitModel();
+    if(model.ready){
+      out.forEach(function(p){
+        p._fit=fitScore(p,model);
+        p._rank=p._cv.total+(p._fit?p._fit.pts:0);
+      });
+    } else out.forEach(function(p){p._fit=null;p._rank=p._cv.total;});
+  } else out.forEach(function(p){p._fit=null;p._rank=p._cv.total;});
+
   out.sort(function(a,b){
-    var d=b._cv.total-a._cv.total;
+    var d=(b._rank!=null?b._rank:b._cv.total)-(a._rank!=null?a._rank:a._cv.total);
     if(Math.abs(d)>0.001)return d;
     // tie-break on build strength, then liquidity
     var ha=(a._heat&&a._heat.score)||0, hb=(b._heat&&b._heat.score)||0;
@@ -1234,6 +1245,7 @@ function runScan(){
 
     function finish(){
       if(finished)return; finished=true;
+      shadowRecord(S.passed.concat(S.unverified));
       S.passed.sort(function(a,b){return b._cv.total-a._cv.total;});
       S.loading=false;S.progress="";S.pct=100;S.lastFetch=Date.now();render();
     }
@@ -1329,6 +1341,7 @@ function runHeat(){
 
     var i=0,active=0,CONC=3,fin=false;
     function done(){if(fin)return;fin=true;
+      shadowRecord(S.heat.concat(S.heatUnverified));
       S.heat.sort(function(a,b){return b._heat.score-a._heat.score;});
       S.heatLoading=false;render();}
     function pump(){
@@ -1411,6 +1424,7 @@ function runFresh(){
 
     var i=0,active=0,CONC=3,fin=false;
     function done(){ if(fin)return;fin=true;
+      shadowRecord(S.fresh.concat(S.freshUnverified));
       if(S.cfg.freshSortBySurge!==false)
         S.fresh.sort(function(a,b){return (b._surgeScore||0)-(a._surgeScore||0);});
       else
@@ -2205,6 +2219,294 @@ function postMortemHTML(t){
     '<b style="color:var(--text)">'+esc(pm.story)+'</b><br><br>'+pm.lesson+'</div></div>';
 }
 
+// ===========================================================================
+// PERSONALISED FIT  —  ranking learned from your own resolved trades
+//
+// For each attribute (grade, chain, size band, age band, profile match, heat)
+// this measures how your trades in that bucket actually performed, then nudges
+// a candidate's rank up or down accordingly.
+//
+// The statistics matter here. Raw bucket averages are wildly unreliable at
+// small n — three lucky trades on one chain would otherwise dominate ranking
+// forever. So every bucket is shrunk toward zero by n/(n+K): with 2 trades a
+// bucket carries almost no weight, with 20 it carries most of its measured
+// value. The total adjustment is also capped, so this can nudge the order but
+// never override the underlying analysis, and it NEVER touches the safety gate.
+// ===========================================================================
+var FIT_K=6;              // shrinkage constant
+var FIT_MAX=14;           // most points fit can add or remove
+var FIT_MIN_TRADES=12;    // below this, personalisation stays off
+
+function fitModel(){
+  var closed=S.trades.filter(function(t){return t.status==="closed"&&t.fp&&isFinite(t.pnl);});
+  if(closed.length<FIT_MIN_TRADES)return {ready:false,n:closed.length};
+
+  // Normalise P&L to "per dollar staked" so trades of different sizes compare.
+  var norm=closed.map(function(t){
+    return {fp:t.fp, r:(t.size>0?t.pnl/t.size:0)};
+  });
+  var overall=norm.reduce(function(a,x){return a+x.r;},0)/norm.length;
+
+  function bucketStats(keyFn){
+    var m={};
+    norm.forEach(function(x){
+      var k=keyFn(x.fp); if(k==null||k==="?")return;
+      m[k]=m[k]||{n:0,sum:0};
+      m[k].n++; m[k].sum+=x.r;
+    });
+    var out={};
+    Object.keys(m).forEach(function(k){
+      var mean=m[k].sum/m[k].n;
+      // difference from your own average, shrunk by sample size
+      var edge=(mean-overall)*(m[k].n/(m[k].n+FIT_K));
+      out[k]={n:m[k].n,mean:mean,edge:edge};
+    });
+    return out;
+  }
+
+  return {
+    ready:true, n:closed.length, overall:overall,
+    grade:bucketStats(function(f){return f.grade;}),
+    chain:bucketStats(function(f){return f.chain;}),
+    fdv:bucketStats(function(f){return f.fdvBand;}),
+    age:bucketStats(function(f){return f.ageBand;}),
+    profile:bucketStats(function(f){return f.profile==null?null:(f.profile>=5?"hi":f.profile>=3?"mid":"lo");}),
+    heat:bucketStats(function(f){return f.heat==null?null:(f.heat>=60?"hi":f.heat>=35?"mid":"lo");})
+  };
+}
+
+// Score a candidate against that model. Returns points and the reasons why.
+function fitScore(p,model){
+  if(!model||!model.ready||!p._cv)return null;
+  var fdv=num(p.fdv||p.marketCap), age=ageH(p.pairCreatedAt);
+  var band=fdv<100000?"<100K":fdv<500000?"100K-500K":fdv<2000000?"500K-2M":fdv<10000000?"2M-10M":">10M";
+  var ageBand=age==null?"?":age<6?"<6h":age<24?"6-24h":age<72?"1-3d":age<336?"3-14d":">14d";
+  var pm=profileMatch(p);
+  var profBand=pm?(pm.n>=5?"hi":pm.n>=3?"mid":"lo"):null;
+  var hs=p._heat?p._heat.score:null;
+  var heatBand=hs==null?null:(hs>=60?"hi":hs>=35?"mid":"lo");
+
+  var parts=[];
+  function add(map,key,label){
+    if(!map||key==null)return;
+    var b=map[key]; if(!b||b.n<2)return;
+    parts.push({label:label,key:key,n:b.n,edge:b.edge});
+  }
+  add(model.grade,p._cv.grade,"grade "+p._cv.grade);
+  add(model.chain,p.chainId,chainName(p.chainId));
+  add(model.fdv,band,band+" size");
+  add(model.age,ageBand,ageBand+" old");
+  add(model.profile,profBand,profBand==="hi"?"strong profile match":profBand==="mid"?"partial profile match":"weak profile match");
+  add(model.heat,heatBand,heatBand==="hi"?"high heat":heatBand==="mid"?"moderate heat":"low heat");
+
+  if(!parts.length)return null;
+  // average the edges, then convert to points and cap
+  var avgEdge=parts.reduce(function(a,x){return a+x.edge;},0)/parts.length;
+  var pts=Math.max(-FIT_MAX,Math.min(FIT_MAX,avgEdge*22));
+  parts.sort(function(a,b){return Math.abs(b.edge)-Math.abs(a.edge);});
+  return {pts:pts,parts:parts,n:model.n};
+}
+
+function fitHTML(p){
+  if(!S.cfg.personalise||!p._fit)return "";
+  var f=p._fit;
+  if(Math.abs(f.pts)<1)return "";
+  var up=f.pts>0, col=up?"var(--frog)":"var(--red)";
+  var top=f.parts.slice(0,3).filter(function(x){return Math.abs(x.edge)>0.01;});
+  return '<div style="margin-top:12px;padding:12px 13px;border-radius:10px;border:1px solid '+col+
+    ';background:rgba(255,255,255,.02)">'+
+    '<div style="font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:'+col+'">'+
+    'Fit to your results '+(up?"+":"")+f.pts.toFixed(0)+'</div>'+
+    '<div style="margin-top:7px;font-size:13.5px;line-height:1.6;color:var(--text2)">'+
+    (top.length
+      ? top.map(function(x){
+          return (x.edge>0?"\u2191 ":"\u2193 ")+esc(x.label)+" ("+x.n+" of your trades)";
+        }).join("<br>")
+      : "Neutral against your history.")+
+    '<br><span style="color:var(--dim);font-size:12.5px">Based on '+f.n+
+    ' resolved trades. Adjusts rank only \u2014 never safety.</span></div></div>';
+}
+
+// ===========================================================================
+// SHADOW TRACKING  —  what happened to the ones you did NOT take
+//
+// The learning model has a blind spot: it only sees trades you logged, which
+// is a sample you selected. It can tell you what your winners had in common,
+// but not whether your picking beats simply taking everything the scanner
+// surfaced. So every candidate shown is quietly recorded and its peak tracked.
+// Later this answers the only question that really matters about selection:
+// did choosing help, or would taking them all have done just as well?
+// ===========================================================================
+var SHADOW_KEY="rp:shadow";
+var SHADOW_MAX=400;
+var SHADOW_TTL=14*24*3600*1000;
+
+function shadowLoad(){
+  if(!LS_OK)return {};
+  try{var r=localStorage.getItem(SHADOW_KEY);var o=r?JSON.parse(r):{};return (o&&typeof o==="object")?o:{};}
+  catch(e){return {};}
+}
+function shadowSave(o){
+  if(!LS_OK)return;
+  try{localStorage.setItem(SHADOW_KEY,JSON.stringify(o));}
+  catch(e){ try{localStorage.removeItem(SHADOW_KEY);}catch(e2){} }
+}
+
+// Record a candidate the scanner showed. First sighting only — the entry
+// snapshot must not be overwritten later or the peak becomes meaningless.
+function shadowRecord(list){
+  if(!LS_OK||!list||!list.length)return;
+  var o=shadowLoad(), now=Date.now(), added=0;
+  list.forEach(function(p){
+    if(!p||!p._cv||!p.baseToken)return;
+    var k=(p.chainId||"")+":"+String(p.baseToken.address||"").toLowerCase();
+    if(o[k])return;
+    var price=num(p.priceUsd); if(price<=0)return;
+    o[k]={
+      t:now, sym:p.baseToken.symbol||"?", chain:p.chainId,
+      p0:price, peak:price, last:price, seen:1,
+      grade:p._cv.grade, score:p._cv.total,
+      heat:(p._heat&&p._heat.score)||null,
+      fdv:num(p.fdv||p.marketCap),
+      ageH:ageH(p.pairCreatedAt)
+    };
+    added++;
+  });
+  // prune old and cap size
+  var keys=Object.keys(o);
+  keys.forEach(function(k){ if(now-o[k].t>SHADOW_TTL)delete o[k]; });
+  keys=Object.keys(o);
+  if(keys.length>SHADOW_MAX){
+    keys.sort(function(a,b){return o[a].t-o[b].t;});
+    keys.slice(0,keys.length-SHADOW_MAX).forEach(function(k){delete o[k];});
+  }
+  if(added)shadowSave(o);
+}
+
+// Update peaks from whatever prices the live feed already fetched. No extra
+// network calls — this piggybacks on data that is arriving anyway.
+function shadowUpdate(){
+  if(!LS_OK)return;
+  var o=shadowLoad(), changed=false;
+  Object.keys(LIVE.prices).forEach(function(k){
+    var e=o[k]; if(!e)return;
+    var px=LIVE.prices[k].px; if(!(px>0))return;
+    e.last=px; e.seen=(e.seen||0)+1;
+    if(px>e.peak){e.peak=px;changed=true;}
+    else changed=true;
+  });
+  if(changed)shadowSave(o);
+}
+
+// Compare what you took against what you passed on.
+function shadowStats(){
+  if(!LS_OK)return null;
+  var o=shadowLoad();
+  var keys=Object.keys(o);
+  if(!keys.length)return null;
+
+  var taken={}, n=0;
+  S.trades.forEach(function(t){
+    if(!t.addr)return;
+    taken[(t.chain||"")+":"+String(t.addr).toLowerCase()]=1; n++;
+  });
+
+  function summarise(arr){
+    if(!arr.length)return null;
+    var hit2=0,hit4=0,down50=0,sumPeak=0;
+    arr.forEach(function(e){
+      var m=e.p0>0?e.peak/e.p0:1;
+      var d=e.p0>0?e.last/e.p0:1;
+      if(m>=2)hit2++;
+      if(m>=4)hit4++;
+      if(d<=0.5)down50++;
+      sumPeak+=m;
+    });
+    return {n:arr.length,hit2:hit2,hit4:hit4,down50:down50,
+      pct2:(hit2/arr.length)*100,pct4:(hit4/arr.length)*100,
+      pctDown:(down50/arr.length)*100,avgPeak:sumPeak/arr.length};
+  }
+
+  var all=keys.map(function(k){return o[k];});
+  var tookArr=keys.filter(function(k){return taken[k];}).map(function(k){return o[k];});
+  var skipArr=keys.filter(function(k){return !taken[k];}).map(function(k){return o[k];});
+
+  // mature enough to judge: seen more than once and at least an hour old
+  var mature=function(e){return (Date.now()-e.t)>3600000&&e.seen>1;};
+  return {
+    tracked:all.length,
+    matureCount:all.filter(mature).length,
+    all:summarise(all.filter(mature)),
+    took:summarise(tookArr.filter(mature)),
+    skipped:summarise(skipArr.filter(mature)),
+    best:all.filter(mature).map(function(e){
+      return {sym:e.sym,chain:e.chain,grade:e.grade,mult:e.p0>0?e.peak/e.p0:1,taken:!!taken[(e.chain||"")+":"+""]};
+    }).sort(function(a,b){return b.mult-a.mult;}).slice(0,5)
+  };
+}
+
+function shadowPanelHTML(){
+  var s=shadowStats();
+  if(!s||!s.all)return '<div class="banner info"><b>Shadow tracking</b><br><br>'+
+    'Every token the scanner shows you is quietly followed, whether you log it or not. '+
+    'After a while this can tell you something the trade log alone cannot: whether your picking '+
+    'beats simply taking everything shown.<br><br>Nothing mature enough to report yet.</div>';
+
+  var h='<div class="banner info"><b>\ud83d\udc41 Shadow tracking \u2014 '+s.matureCount+
+    ' tokens followed</b><br><br>'+
+    'Of every candidate the scanner surfaced, here is what actually happened \u2014 including '+
+    'the ones you passed on.</div>';
+
+  function row(label,st,col){
+    if(!st)return "";
+    return '<div class="fac"><span class="fl">'+esc(label)+' <span style="color:var(--dim);font-size:12px">('+
+      st.n+')</span></span>'+
+      '<span class="fw">'+st.pct2.toFixed(0)+'% hit 2x</span>'+
+      '<span class="fv" style="color:'+col+';width:auto">peak '+st.avgPeak.toFixed(2)+'x</span></div>';
+  }
+  h+='<div class="factors" style="margin:0 18px 12px"><div class="hd"><span>Everything shown vs what you took</span>'+
+    '<span>avg peak</span></div>'+
+    row("All candidates shown",s.all,"var(--text2)")+
+    row("Ones you logged",s.took,"var(--frog)")+
+    row("Ones you skipped",s.skipped,"var(--amber)")+
+    '</div>';
+
+  if(s.took&&s.skipped&&s.took.n>=5&&s.skipped.n>=5){
+    var better=s.took.avgPeak>s.skipped.avgPeak;
+    var gap=Math.abs(s.took.avgPeak-s.skipped.avgPeak);
+    h+='<div style="margin:0 18px 12px;padding:14px;border-radius:11px;border:1.5px solid '+
+      (better?"var(--frog)":"var(--amber)")+';background:rgba(255,255,255,.02);font-size:14.5px;'+
+      'line-height:1.7;color:var(--text2)">'+
+      (better
+        ? '<b style="color:var(--frog)">Your picking is adding something.</b> The tokens you logged '+
+          'peaked at '+s.took.avgPeak.toFixed(2)+'x on average versus '+s.skipped.avgPeak.toFixed(2)+
+          'x for the ones you skipped.'
+        : '<b style="color:var(--amber)">Your picking is not beating the list yet.</b> The ones you '+
+          'skipped peaked at '+s.skipped.avgPeak.toFixed(2)+'x on average versus '+s.took.avgPeak.toFixed(2)+
+          'x for the ones you took.')+
+      (gap<0.15?' The gap is small enough that it could easily be chance.':'')+
+      '<br><br><span style="color:var(--dim);font-size:13px">Peak is the best price reached while '+
+      'being tracked \u2014 not what you would have got, since it assumes selling at the exact top. '+
+      'It measures which candidates had the move in them, not what you would have captured.</span></div>';
+  } else {
+    h+='<div class="banner warn">Need at least 5 mature tokens in each group before comparing taken '+
+      'against skipped. Keep scanning and logging.</div>';
+  }
+
+  if(s.best&&s.best.length){
+    h+='<div class="factors" style="margin:0 18px 12px"><div class="hd"><span>Biggest movers tracked</span>'+
+      '<span>peak</span></div>';
+    s.best.forEach(function(x){
+      h+='<div class="fac"><span class="fl">'+esc(x.sym)+' <span style="color:var(--dim);font-size:12px">'+
+        esc(chainName(x.chain))+' \u00b7 '+esc(x.grade)+'</span></span>'+
+        '<span class="fv" style="color:'+(x.mult>=2?"var(--frog)":"var(--dim)")+';width:auto">'+
+        x.mult.toFixed(2)+'x</span></div>';
+    });
+    h+='</div>';
+  }
+  return h;
+}
+
 function exportTradesCSV(){
   var rows=[["symbol","chain","address","paper","grade","score","heat","fdv","fdv_band",
     "age_hours","age_band","liq_ratio","profile_traits","verdict","accel","turn","room","flow",
@@ -2573,6 +2875,7 @@ function liveTick(){
       syncLive(k,next);
     });
     LIVE.lastTick=Date.now();
+    shadowUpdate();
     if(resolveAllPaper()) render(); else paintLive();
   }).catch(function(){}).then(function(){LIVE.inflight=false;});
 }
@@ -3212,6 +3515,18 @@ function scanPane(){
        ((fee/S.cfg.sizeUsd)*100).toFixed(0)+'% of your stake gone before price moves. Solana and Base cost a few cents — use those for small stakes.</div>';
   }
 
+  var fm=fitModel();
+  if(S.cfg.personalise&&fm.ready){
+    h+='<div class="banner info" style="border-color:var(--frog)"><b>\ud83e\udde0 Personalised ranking is on</b><br><br>'+
+      'Ordering is adjusted using your '+fm.n+' resolved trades \u2014 tokens resembling your winners move up, '+
+      'ones resembling your losers move down. Each card shows why.<br><br>'+
+      '<span style="color:var(--dim)">Capped at \u00b1'+FIT_MAX+' points, and buckets with few trades barely '+
+      'count, so a lucky streak cannot hijack the ranking. Safety checks are untouched.</span></div>';
+  } else if(S.cfg.personalise){
+    h+='<div class="banner warn"><b>\ud83e\udde0 Personalised ranking waiting for data</b><br><br>'+
+      fm.n+' of '+FIT_MIN_TRADES+' resolved trades. Once there are enough, ranking starts favouring the kinds '+
+      'of tokens that actually worked for you. Paper trades count.</div>';
+  }
   h+='<div class="banner info">Tuned for small stacks. Liquidity requirements scale to <b>your</b> stake instead of a fixed floor, and network fees are a blocking check — because at '+usd(S.cfg.sizeUsd)+' the gas bill matters more than slippage.</div>';
 
   if(S.localBlocked)return h+localFileNotice();
@@ -3476,7 +3791,7 @@ function journalPane(){
 
   if(S.showStats){
     return '<div class="toolbar"><button class="primary" id="backJournal">\u2190 Back to trades</button></div>'+
-      learnPanelHTML();
+      learnPanelHTML()+shadowPanelHTML();
   }
 
   var openN=S.trades.filter(function(t){return t.status==="open";}).length;
@@ -4182,6 +4497,7 @@ function cfgPane(){
   compact(need)+'</b> of liquidity, and anything costing more than <b>'+usd(c.sizeUsd*c.maxFeeDragPct/100)+
   '</b> in total fees gets blocked.</div>'+
 
+  '<div class="tog"><div><div class="t">Personalised ranking</div><div class="s">Reorder results using your own resolved trades \u2014 tokens like your winners rise, tokens like your losers fall. Activates after '+FIT_MIN_TRADES+' resolved trades. Never affects safety checks.</div></div>'+sw("swPers",c.personalise)+'</div>'+
   '<div class="tog"><div><div class="t">Strict mode</div><div class="s">Block anything unverifiable, not just what fails outright. Unverifiable usually means brand new or deliberately obscured.</div></div>'+sw("swStrict",c.strict)+'</div>'+
   '<div class="tog"><div><div class="t">Require locked liquidity</div><div class="s">Block tokens without 50%+ of LP locked or burned. Unlocked LP is how most rugs happen.</div></div>'+sw("swLp",c.requireLpLock)+'</div>'+
   '<div class="tog"><div><div class="t">Hide blocked tokens</div><div class="s">Off by default — seeing what got caught shows the filter working.</div></div>'+sw("swHide",c.hideBlocked)+'</div>'+
@@ -4487,7 +4803,7 @@ function render(){
 
   function bind(id,k){var el=document.getElementById(id);
     if(el)el.onclick=function(){S.cfg[k]=!S.cfg[k];saveCfg();render();};}
-  bind("swStrict","strict");bind("swLp","requireLpLock");bind("swHide","hideBlocked");
+  bind("swStrict","strict");bind("swLp","requireLpLock");bind("swHide","hideBlocked");bind("swPers","personalise");
   var swL=document.getElementById("swLive");
   if(swL)swL.onclick=function(){S.cfg.liveEnabled=!S.cfg.liveEnabled;saveCfg();restartLive();render();};
 
