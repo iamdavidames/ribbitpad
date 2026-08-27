@@ -2477,6 +2477,80 @@ function postMortem(t){
   return {tone:tone,story:story,lesson:lesson,won:won,mult:mult};
 }
 
+// Where does this trade actually stand right now? A bar from stop to next
+// target, with the current price marked on it. Reading "it is 12% above the
+// stop" takes a moment; seeing the marker sitting next to the red end does not.
+function tradeStatusHTML(t){
+  var open=t.status==="open";
+  var lp=t.live||0;
+  var mult=(t.entry>0&&lp)?lp/t.entry:null;
+  var stopMult=1-(t.stopPct/100);
+  var steps=(t.tps||[]).slice().sort(function(a,b){return a-b;});
+  var hitMults=(t.events||[]).filter(function(e){return e.kind==="tp";}).map(function(e){return e.mult;});
+  var nextT=steps.filter(function(m){return hitMults.indexOf(m)<0;})[0]||null;
+
+  // ---- header badge ----
+  var badge,bcol,bnote;
+  if(!open){
+    var won=t.pnl>0;
+    bcol=won?"var(--frog)":"var(--red)";
+    badge=won?"\u2705 CLOSED \u00b7 PROFIT":"\u274c CLOSED \u00b7 LOSS";
+    var how=(t.events||[]).some(function(e){return e.kind==="stop";})?"stopped out"
+      :hitMults.length?"hit "+hitMults[hitMults.length-1]+"x":"closed manually";
+    bnote=how+" \u00b7 "+(t.pnl>=0?"+":"")+usd(t.pnl)+" on "+usd(t.size);
+  } else if(!lp){
+    bcol="var(--dim)"; badge="\u23f3 OPEN \u00b7 WAITING FOR PRICE";
+    bnote="turn on live prices, or tap Update prices";
+  } else {
+    var near=mult<=stopMult*1.12;
+    bcol=near?"var(--red)":mult>=2?"var(--frog)":mult>=1?"#9BE88A":"var(--amber)";
+    badge=near?"\u26a0\ufe0f OPEN \u00b7 CLOSE TO STOP":
+      mult>=2?"\ud83d\ude80 OPEN \u00b7 "+mult.toFixed(2)+"x":
+      "\u23f3 OPEN \u00b7 "+mult.toFixed(2)+"x";
+    bnote=hitMults.length
+      ? "already sold at "+hitMults.join("x, ")+"x \u00b7 "+(t.remaining*100).toFixed(0)+"% still held"
+      : "nothing sold yet \u00b7 100% held";
+  }
+
+  var h='<div style="margin:-2px 0 12px;padding:12px 13px;border-radius:10px;border:1.5px solid '+bcol+
+    ';background:rgba(255,255,255,.03)">'+
+    '<div style="font-size:14.5px;font-weight:800;color:'+bcol+'">'+badge+'</div>'+
+    '<div style="margin-top:4px;font-size:13px;color:var(--dim)">'+esc(bnote)+'</div>';
+
+  // ---- progress bar: stop ......... entry ......... next target ----
+  if(open&&mult&&nextT){
+    var lo=stopMult, hi=nextT;
+    var pos=Math.max(0,Math.min(1,(mult-lo)/(hi-lo)));
+    var entryPos=Math.max(0,Math.min(1,(1-lo)/(hi-lo)));
+    h+='<div style="margin-top:13px">'+
+      '<div style="position:relative;height:10px;border-radius:5px;overflow:hidden;'+
+      'background:linear-gradient(90deg,rgba(255,107,122,.35),rgba(255,194,77,.25),rgba(110,232,90,.35))">'+
+      '<div style="position:absolute;left:'+(entryPos*100).toFixed(1)+'%;top:0;bottom:0;width:2px;'+
+      'background:var(--text2);opacity:.6"></div>'+
+      '<div style="position:absolute;left:'+(pos*100).toFixed(1)+'%;top:-3px;width:4px;height:16px;'+
+      'border-radius:2px;background:'+bcol+';box-shadow:0 0 6px '+bcol+'"></div>'+
+      '</div>'+
+      '<div style="display:flex;justify-content:space-between;margin-top:6px;font-size:11.5px;'+
+      'color:var(--dim);font-family:var(--mono)">'+
+      '<span style="color:var(--red)">stop '+px(t.entry*stopMult)+'</span>'+
+      '<span>entry</span>'+
+      '<span style="color:var(--frog)">'+nextT+'x '+px(t.entry*nextT)+'</span>'+
+      '</div></div>';
+
+    // plain-language distance
+    var toStop=((mult-stopMult)/mult)*100;
+    var toNext=((nextT-mult)/mult)*100;
+    h+='<div style="margin-top:11px;font-size:13.5px;line-height:1.7;color:var(--text2)">'+
+      'Needs to fall <b style="color:var(--red)">'+toStop.toFixed(0)+'%</b> to hit your stop, '+
+      'or rise <b style="color:var(--frog)">'+toNext.toFixed(0)+'%</b> to hit '+nextT+'x.'+
+      '</div>';
+  } else if(open&&mult&&!nextT){
+    h+='<div style="margin-top:11px;font-size:13.5px;color:var(--text2)">'+
+      'Past every target you set \u2014 only the stop is left.</div>';
+  }
+  return h+'</div>';
+}
+
 function postMortemHTML(t){
   var pm=postMortem(t); if(!pm)return "";
   var col=pm.tone==="win"?"var(--frog)":pm.tone==="loss"?"var(--red)":"var(--amber)";
@@ -5057,7 +5131,34 @@ function journalPane(){
     }
   }
 
-  S.trades.forEach(function(t){
+  // Open trades first — those are the ones you might still act on. Within
+  // open, the ones nearest their stop lead, since those are the urgent ones.
+  var ordered=S.trades.slice().sort(function(a,b){
+    if((a.status==="open")!==(b.status==="open"))return a.status==="open"?-1:1;
+    if(a.status==="open"&&b.status==="open"){
+      var am=(a.live&&a.entry)?a.live/a.entry:99, bm=(b.live&&b.entry)?b.live/b.entry:99;
+      var as=1-(a.stopPct/100), bs=1-(b.stopPct/100);
+      return (am-as)-(bm-bs);
+    }
+    return (b.exitAt||b.opened)-(a.exitAt||a.opened);
+  });
+
+  var oc=ordered.filter(function(t){return t.status==="open";}).length;
+  var cc=ordered.length-oc;
+  if(ordered.length){
+    h+='<div style="margin:18px 18px 10px;font-size:12.5px;text-transform:uppercase;'+
+      'letter-spacing:.09em;font-weight:800;color:var(--text2)">'+
+      oc+' still open \u00b7 '+cc+' closed</div>';
+  }
+  var lastOpen=null;
+  ordered.forEach(function(t){
+    // divider between the open block and the closed block
+    if(lastOpen===true&&t.status!=="open"){
+      h+='<div style="margin:20px 18px 10px;padding-top:14px;border-top:1px solid var(--line);'+
+        'font-size:12.5px;text-transform:uppercase;letter-spacing:.09em;font-weight:800;'+
+        'color:var(--dim)">Finished</div>';
+    }
+    lastOpen=(t.status==="open");
     var open=t.status==="open";
     var live=t.live||0;
     var pnlPct=open&&live&&t.entry?((live-t.entry)/t.entry)*100:null;
@@ -5078,6 +5179,7 @@ function journalPane(){
     }
     h+='</div>';
 
+    h+=tradeStatusHTML(t);
     var lk2=liveKey(t.chain,t.addr);
 
     // Live comparison of what you paid against what it's worth now. This is
