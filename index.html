@@ -512,7 +512,7 @@ var S={
   watch:[], watchData:{}, watchLoading:false, watchErr:null, watchInput:"",
   wallets:[], walletInput:"",
   trades:[], tradesLoading:false, journalNote:null, expanded:{}, seenIntro:false,
-  showLearn:false, learnOpen:{}, logPrompt:null, showStats:false, storageError:null,
+  showLearn:false, learnOpen:{}, logPrompt:null, showStats:false, storageError:null, logFilter:'all',
   watching:false, watchTimer:null, alerts:[], notifOk:false
 };
 
@@ -1136,6 +1136,7 @@ function preScreen(p){
 
 function runScan(){
   fetchTrending();
+  fetchNarratives();
   if(IS_LOCAL_FILE){ S.localBlocked=true; S.error=null; render(); return; }
   S.loading=true;S.error=null;S.localBlocked=false;S.passed=[];S.blocked=[];S.pct=0;
   S.progress="Sweeping every chain…";render();
@@ -1283,7 +1284,7 @@ function runScan(){
 
     function finish(){
       if(finished)return; finished=true;
-      S.passed.concat(S.unverified).forEach(function(p){p._attn=attentionFor(p);});
+      S.passed.concat(S.unverified).forEach(function(p){p._attn=attentionFor(p);p._narr=narrativeFor(p);});
       socialEnrich(S.passed.concat(S.unverified));
       shadowRecord(S.passed.concat(S.unverified));
       S.passed.sort(function(a,b){return b._cv.total-a._cv.total;});
@@ -1344,6 +1345,7 @@ function lookupOne(q){
 // ===========================================================================
 function runHeat(){
   fetchTrending();
+  fetchNarratives();
   if(IS_LOCAL_FILE){S.localBlocked=true;render();return;}
   S.heatLoading=true;S.heatErr=null;S.heat=[];S.heatUnverified=[];S.heatBlocked=[];render();
 
@@ -1384,7 +1386,7 @@ function runHeat(){
 
     var i=0,active=0,CONC=3,fin=false;
     function done(){if(fin)return;fin=true;
-      S.heat.concat(S.heatUnverified).forEach(function(p){p._attn=attentionFor(p);});
+      S.heat.concat(S.heatUnverified).forEach(function(p){p._attn=attentionFor(p);p._narr=narrativeFor(p);});
       socialEnrich(S.heat.concat(S.heatUnverified));
       shadowRecord(S.heat.concat(S.heatUnverified));
       S.heat.sort(function(a,b){return b._heat.score-a._heat.score;});
@@ -1472,7 +1474,7 @@ function runFresh(){
 
     var i=0,active=0,CONC=3,fin=false;
     function done(){ if(fin)return;fin=true;
-      S.fresh.concat(S.freshUnverified).forEach(function(p){p._attn=attentionFor(p);});
+      S.fresh.concat(S.freshUnverified).forEach(function(p){p._attn=attentionFor(p);p._narr=narrativeFor(p);});
       socialEnrich(S.fresh.concat(S.freshUnverified));
       shadowRecord(S.fresh.concat(S.freshUnverified));
       if(S.cfg.freshSortBySurge!==false)
@@ -1611,6 +1613,8 @@ function logTrade(p,entryOverride,sizeOverride,paperMode){
         ageH: age, ageBand: age==null?"?": age<6?"<6h": age<24?"6-24h": age<72?"1-3d": age<336?"3-14d":">14d",
         verdict:(p._gate&&p._gate.verdict)||"?",
         trending:p._attn?(p._attn.confident?"yes":"ticker-only"):"no",
+        narrative:p._narr?p._narr.id:null,
+        narrativeHot:p._narr?"yes":"no",
         blockers:(p._gate&&Array.isArray(p._gate.blockers))?p._gate.blockers.slice(0,6):[],
         xAccounts:(p._social&&p._social.accounts!=null)?p._social.accounts:null,
         xNewPct:(p._social&&p._social.newPct!=null)?p._social.newPct:null,
@@ -1975,7 +1979,8 @@ function learnBuckets(){
     byHeat:group(function(f){return f.heat==null?null:(f.heat>=60?"heat 60+":f.heat>=35?"heat 35-59":"heat <35");},"Heat score"),
     byVerdict:group(function(f){return f.verdict;},"Safety verdict"),
     byTrending:group(function(f){return f.trending;},"Trending when you bought"),
-    byX:group(function(f){return f.xBand;},"X activity when you bought")
+    byX:group(function(f){return f.xBand;},"X activity when you bought"),
+    byNarrative:group(function(f){return f.narrativeHot;},"Rode a hot narrative")
   };
 }
 
@@ -2220,7 +2225,7 @@ function learnPanelHTML(){
   }
 
   // the raw tables, always shown
-  [b.byGrade,b.byProfile,b.byHeat,b.byTrending,b.byX,b.byFdv,b.byAge,b.byChain,b.byVerdict].forEach(function(gr){
+  [b.byGrade,b.byProfile,b.byHeat,b.byTrending,b.byNarrative,b.byX,b.byFdv,b.byAge,b.byChain,b.byVerdict].forEach(function(gr){
     if(!gr.rows.length)return;
     h+='<div class="factors" style="margin:0 18px 12px"><div class="hd"><span>'+esc(gr.label)+
       '</span><span>expectancy</span></div>';
@@ -2859,6 +2864,88 @@ function retargetPanelHTML(){
 // surfaced got worse in the same period, conditions changed. If only your
 // picks got worse while the pool held up, that is selection.
 // ===========================================================================
+// ===========================================================================
+// CALIBRATION  —  what a grade has actually been worth
+//
+// A grade is a prediction. The only honest way to say how much confidence it
+// deserves is to check what that grade has actually delivered for you. This
+// reports the real hit rate per grade: of your A+ trades, how many reached 2x.
+//
+// It exists partly to prevent a specific mistake: treating a high grade as
+// certainty. If your A+ tokens hit 2x 40% of the time, that is what A+ means
+// for you — a better-than-average shot, not a promise. Displaying the real
+// number makes that impossible to misread.
+// ===========================================================================
+function gradeCalibration(){
+  var closed=S.trades.filter(function(t){
+    return t.status==="closed"&&t.fp&&t.fp.grade&&isFinite(t.pnl)&&t.size>0&&!t.blockedTest;
+  });
+  if(closed.length<8)return {ready:false,n:closed.length};
+
+  var m={};
+  closed.forEach(function(t){
+    var g=t.fp.grade;
+    m[g]=m[g]||{n:0,win:0,hit2:0,sum:0};
+    m[g].n++;
+    if(t.pnl>0)m[g].win++;
+    if(isFinite(t.peak)&&t.peak>=2)m[g].hit2++;
+    m[g].sum+=t.pnl/t.size;
+  });
+  var rows=Object.keys(m).map(function(g){
+    return {grade:g,n:m[g].n,win:m[g].win,hit2:m[g].hit2,
+      winPct:(m[g].win/m[g].n)*100, hit2Pct:(m[g].hit2/m[g].n)*100,
+      exp:m[g].sum/m[g].n};
+  }).sort(function(a,b){return GRADE_ORDER.indexOf(b.grade)-GRADE_ORDER.indexOf(a.grade);});
+  return {ready:true,n:closed.length,rows:rows};
+}
+
+// Shown on the card itself: what this grade has been worth to you.
+function calibrationNote(grade){
+  var c=gradeCalibration();
+  if(!c.ready)return null;
+  var r=c.rows.filter(function(x){return x.grade===grade;})[0];
+  if(!r||r.n<3)return null;
+  return r;
+}
+
+function calibrationHTML(){
+  var c=gradeCalibration();
+  if(!c.ready)
+    return '<div class="banner info"><b>\ud83c\udfaf What a grade is actually worth</b><br><br>'+
+      'Once 8 trades resolve, this shows what each grade has really delivered \u2014 how often an A+ '+
+      'reached 2x, how often it lost. That is the only honest measure of how much a grade should be '+
+      'trusted.<br><br>'+c.n+' of 8 so far.</div>';
+
+  var h='<div class="banner info"><b>\ud83c\udfaf What each grade has been worth \u00b7 '+c.n+' trades</b><br><br>'+
+    'Real hit rates from your own history. This is what a grade actually means for you \u2014 not what '+
+    'it sounds like it should mean.</div>';
+
+  h+='<div class="factors" style="margin:0 18px 12px"><div class="hd"><span>Grade</span>'+
+    '<span>reached 2x</span></div>';
+  c.rows.forEach(function(r){
+    var col=r.exp>=0?"var(--frog)":"var(--red)";
+    h+='<div class="fac"><span class="fl" style="color:'+gradeColor(r.grade)+';font-weight:800">'+
+      esc(r.grade)+'<span style="color:var(--dim);font-weight:400;font-size:12px"> \u00b7 '+r.n+' trades</span></span>'+
+      '<span class="fw">'+r.hit2+'/'+r.n+'</span>'+
+      '<span class="fv" style="color:'+col+';width:auto">'+r.hit2Pct.toFixed(0)+'%</span></div>';
+  });
+  h+='</div>';
+
+  var best=c.rows.filter(function(r){return r.n>=3;})[0];
+  if(best){
+    h+='<div style="margin:0 18px 12px;padding:14px;border-radius:11px;border:1.5px solid var(--amber);'+
+      'background:rgba(255,194,77,.06);font-size:14.5px;line-height:1.7;color:var(--text2)">'+
+      '<b style="color:var(--amber)">There is no certain grade.</b> Your best grade so far, '+
+      esc(best.grade)+', reached 2x in '+best.hit2+' of '+best.n+' cases \u2014 '+
+      best.hit2Pct.toFixed(0)+'%. That is what the top of the scale is worth: a better shot, '+
+      'never a sure thing.<br><br>'+
+      'A grade measures whether a token is well-built and not obviously rigged. Nothing measurable '+
+      'from a contract and a price chart can tell you whether people will keep buying it tomorrow. '+
+      'Any tool claiming otherwise is selling you confidence it does not have.</div>';
+  }
+  return h;
+}
+
 function progressReport(){
   var closed=S.trades.filter(function(t){
     return t.status==="closed"&&isFinite(t.pnl)&&t.size>0;
@@ -3179,6 +3266,132 @@ var SHADOW_TTL=14*24*3600*1000;
 // ===========================================================================
 var TRENDING={at:0, coins:[], byAddr:{}, bySym:{}, loading:false, err:null};
 var TRENDING_TTL=5*60*1000;
+
+// ===========================================================================
+// NARRATIVE TRACKING  —  which themes are actually moving
+//
+// CoinGecko publishes per-category market data. When "AI agents" is up 40% on
+// the day, new tokens riding that theme tend to get attention — which is the
+// real mechanism behind what people call a meme narrative. This is closer to
+// what matters than news headlines, and unlike headlines it is measurable.
+//
+// A token is matched to a narrative by keyword in its name or symbol. That is
+// crude and produces false matches, so the match is shown to you rather than
+// silently folded into the grade, and it is recorded so your own results
+// decide whether riding a hot narrative actually helped.
+// ===========================================================================
+var NARRATIVE={at:0, cats:[], loading:false, err:null};
+var NARRATIVE_TTL=15*60*1000;
+
+// keyword sets for matching a token to a theme
+var NARRATIVE_KEYS={
+  "artificial-intelligence":["ai","gpt","agent","neural","bot","llm","brain","mind"],
+  "meme-token":["dog","cat","pepe","wojak","chad","moon","inu","shib","frog","elon","trump","baby"],
+  "gaming":["game","play","quest","arena","guild","pixel","craft"],
+  "solana-meme-coins":["sol","bonk","wif","pump"],
+  "desci":["sci","bio","gene","lab","research"],
+  "real-world-assets-rwa":["rwa","estate","gold","asset","yield"],
+  "depin":["depin","node","network","mesh","compute"],
+  "animal-racing":["horse","race","racing"],
+  "politifi":["trump","biden","maga","election","vote","potus"]
+};
+
+function fetchNarratives(force){
+  if(NARRATIVE.loading)return Promise.resolve(NARRATIVE);
+  if(!force&&Date.now()-NARRATIVE.at<NARRATIVE_TTL&&NARRATIVE.cats.length)
+    return Promise.resolve(NARRATIVE);
+  NARRATIVE.loading=true;
+  return fetchJSON(CG+"/coins/categories",10000).then(function(d){
+    var cats=[];
+    (Array.isArray(d)?d:[]).forEach(function(c){
+      if(!c)return;
+      var ch=num(c.market_cap_change_24h);
+      if(!isFinite(ch))return;
+      cats.push({
+        id:c.id||"", name:c.name||"", change:ch,
+        mcap:num(c.market_cap), vol:num(c.volume_24h),
+        top:Array.isArray(c.top_3_coins)?c.top_3_coins.length:0
+      });
+    });
+    cats.sort(function(a,b){return b.change-a.change;});
+    NARRATIVE.at=Date.now(); NARRATIVE.cats=cats;
+    NARRATIVE.loading=false; NARRATIVE.err=null;
+    return NARRATIVE;
+  }).catch(function(e){
+    NARRATIVE.loading=false;
+    NARRATIVE.err=(e&&e.message)||"could not load categories";
+    return NARRATIVE;
+  });
+}
+
+// The themes moving hardest right now, with enough size to matter.
+function hotNarratives(n){
+  return NARRATIVE.cats
+    .filter(function(c){return c.mcap>2000000&&c.change>3;})
+    .slice(0,n||6);
+}
+
+// Does this token look like it rides a currently-hot theme?
+function narrativeFor(p){
+  if(!p||!p.baseToken||!NARRATIVE.cats.length)return null;
+  var text=((p.baseToken.name||"")+" "+(p.baseToken.symbol||"")).toLowerCase();
+  var hot=hotNarratives(10);
+  for(var i=0;i<hot.length;i++){
+    var keys=NARRATIVE_KEYS[hot[i].id];
+    if(!keys)continue;
+    for(var j=0;j<keys.length;j++){
+      var k=keys[j];
+      // whole-word-ish match to cut down on nonsense hits
+      if(text.indexOf(k)>=0&&(k.length>=4||new RegExp("\\b"+k+"\\b").test(text))){
+        return {cat:hot[i].name, id:hot[i].id, change:hot[i].change, keyword:k};
+      }
+    }
+  }
+  return null;
+}
+
+function narrativeHTML(p){
+  var nv=p._narr;
+  if(!nv)return "";
+  return '<div style="margin-top:12px;padding:12px 13px;border-radius:10px;border:1px solid var(--blue);'+
+    'background:rgba(93,169,255,.06)">'+
+    '<div style="font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--blue)">'+
+    '\ud83c\udf0a Rides a hot narrative \u00b7 '+esc(nv.cat)+' +'+nv.change.toFixed(0)+'% today</div>'+
+    '<div style="margin-top:7px;font-size:13.5px;line-height:1.65;color:var(--text2)">'+
+    'Matched on the word <b>'+esc(nv.keyword)+'</b> in its name. That is a crude match \u2014 plenty of '+
+    'tokens borrow a theme without belonging to it, and the theme being up today says nothing about '+
+    'this particular token.<br><br>'+
+    '<span style="color:var(--dim);font-size:13px">Recorded and measured against your results, '+
+    'not folded into the grade.</span></div></div>';
+}
+
+function narrativePanelHTML(){
+  if(NARRATIVE.err&&!NARRATIVE.cats.length)
+    return '<div class="banner warn"><b>\ud83c\udf0a Narratives unavailable</b><br><br>'+
+      'Category data could not be loaded just now. It will retry on your next scan.</div>';
+  var hot=hotNarratives(8);
+  if(!hot.length)
+    return '<div class="banner info"><b>\ud83c\udf0a What\u2019s running today</b><br><br>'+
+      'Nothing is clearly leading right now \u2014 no category is up more than 3%. Run a scan to '+
+      'refresh this.</div>';
+
+  var h='<div class="banner info"><b>\ud83c\udf0a What\u2019s running today</b><br><br>'+
+    'Crypto categories by 24h market cap change. New tokens riding a hot theme tend to get more '+
+    'attention \u2014 that is the mechanism behind most meme runs.</div>';
+  h+='<div class="factors" style="margin:0 18px 12px"><div class="hd"><span>Narrative</span>'+
+    '<span>24h</span></div>';
+  hot.forEach(function(c){
+    h+='<div class="fac"><span class="fl">'+esc(c.name)+
+      '<br><span style="color:var(--dim);font-size:12px">'+compact(c.mcap)+' cap</span></span>'+
+      '<span class="fv" style="color:var(--frog);width:auto">+'+c.change.toFixed(1)+'%</span></div>';
+  });
+  h+='</div>';
+  h+='<div class="banner warn"><b>How to use this.</b> A hot narrative tells you where attention is '+
+    'flowing, not which token deserves it. The usual pattern is that the category leaders have already '+
+    'moved by the time it shows up here, and the copies launched afterwards are where most of the '+
+    'losses happen. Treat it as context, never as a reason on its own.</div>';
+  return h;
+}
 
 function fetchTrending(force){
   if(TRENDING.loading)return Promise.resolve(TRENDING);
@@ -4197,7 +4410,19 @@ function cardHTML(p,isBlocked){
     h+='</div>';
   }
 
+  if(cv){
+    var cal=calibrationNote(cv.grade);
+    if(cal){
+      h+='<div style="margin-top:10px;padding:10px 12px;border-radius:9px;background:var(--panel);'+
+        'border:1px solid var(--line);font-size:13.5px;line-height:1.6;color:var(--text2)">'+
+        '<b style="color:'+gradeColor(cv.grade)+'">'+esc(cv.grade)+' in your history:</b> '+
+        cal.hit2+' of '+cal.n+' reached 2x ('+cal.hit2Pct.toFixed(0)+'%), '+
+        'average '+(cal.exp>=0?"+":"")+(cal.exp*100).toFixed(0)+'% per dollar.'+
+        '</div>';
+    }
+  }
   h+=socialHTMLBlock(p);
+  h+=narrativeHTML(p);
   h+=attentionHTML(p);
   h+=fitHTML(p);
   h+=dumpRiskHTML(p);
@@ -4653,6 +4878,7 @@ function scanPane(){
       fm.n+' of '+FIT_MIN_TRADES+' resolved trades. Once there are enough, ranking starts favouring the kinds '+
       'of tokens that actually worked for you. Paper trades count.</div>';
   }
+  h+=narrativePanelHTML();
   h+='<div class="banner info">Tuned for small stacks. Liquidity requirements scale to <b>your</b> stake instead of a fixed floor, and network fees are a blocking check — because at '+usd(S.cfg.sizeUsd)+' the gas bill matters more than slippage.</div>';
 
   if(S.localBlocked)return h+localFileNotice();
@@ -4927,7 +5153,7 @@ function journalPane(){
 
   if(S.showStats){
     return '<div class="toolbar"><button class="primary" id="backJournal">\u2190 Back to trades</button></div>'+
-      progressPanelHTML()+ladderPanelHTML()+weightsPanelHTML()+filterAuditHTML()+learnPanelHTML()+shadowPanelHTML();
+      progressPanelHTML()+calibrationHTML()+ladderPanelHTML()+weightsPanelHTML()+filterAuditHTML()+learnPanelHTML()+shadowPanelHTML();
   }
 
   var openN=S.trades.filter(function(t){return t.status==="open";}).length;
@@ -5144,16 +5370,42 @@ function journalPane(){
   });
 
   var oc=ordered.filter(function(t){return t.status==="open";}).length;
-  var cc=ordered.length-oc;
+  var won=ordered.filter(function(t){return t.status!=="open"&&t.pnl>0;}).length;
+  var lost=ordered.filter(function(t){return t.status!=="open"&&t.pnl<=0;}).length;
+
   if(ordered.length){
-    h+='<div style="margin:18px 18px 10px;font-size:12.5px;text-transform:uppercase;'+
-      'letter-spacing:.09em;font-weight:800;color:var(--text2)">'+
-      oc+' still open \u00b7 '+cc+' closed</div>';
+    // Filter tabs — the fastest way to answer "what am I still holding?"
+    function tab(k,label,n,col){
+      var on=S.logFilter===k;
+      return '<div data-logfilter="'+k+'" style="flex:1;text-align:center;padding:10px 4px;'+
+        'border-radius:9px;cursor:pointer;border:1.5px solid '+(on?col:"var(--line)")+';'+
+        'background:'+(on?"rgba(255,255,255,.05)":"transparent")+'">'+
+        '<div style="font-size:16px;font-weight:800;color:'+(on?col:"var(--text2)")+'">'+n+'</div>'+
+        '<div style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim);'+
+        'margin-top:2px">'+label+'</div></div>';
+    }
+    h+='<div style="display:flex;gap:8px;margin:18px 18px 12px">'+
+      tab("all","All",ordered.length,"var(--text)")+
+      tab("open","Holding",oc,"var(--amber)")+
+      tab("won","Won",won,"var(--frog)")+
+      tab("lost","Lost",lost,"var(--red)")+
+      '</div>';
+
+    if(S.logFilter!=="all"){
+      ordered=ordered.filter(function(t){
+        if(S.logFilter==="open")return t.status==="open";
+        if(S.logFilter==="won")return t.status!=="open"&&t.pnl>0;
+        if(S.logFilter==="lost")return t.status!=="open"&&t.pnl<=0;
+        return true;
+      });
+      if(!ordered.length)
+        h+='<div class="empty">Nothing in this group yet.</div>';
+    }
   }
   var lastOpen=null;
   ordered.forEach(function(t){
     // divider between the open block and the closed block
-    if(lastOpen===true&&t.status!=="open"){
+    if(S.logFilter==="all"&&lastOpen===true&&t.status!=="open"){
       h+='<div style="margin:20px 18px 10px;padding-top:14px;border-top:1px solid var(--line);'+
         'font-size:12.5px;text-transform:uppercase;letter-spacing:.09em;font-weight:800;'+
         'color:var(--dim)">Finished</div>';
@@ -5873,6 +6125,8 @@ function render(){
         tp.map(function(m){return m+"x";}).join(" / ")+", and new trades will use it too.";
       render();
     };});
+  Array.prototype.forEach.call(app.querySelectorAll("[data-logfilter]"),function(b){
+    b.onclick=function(){S.logFilter=b.getAttribute("data-logfilter");render();};});
   Array.prototype.forEach.call(app.querySelectorAll("[data-ease]"),function(b){
     b.onclick=function(){
       var rule=b.getAttribute("data-ease");
