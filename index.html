@@ -508,7 +508,7 @@ var S={
   },
   coverage:null,           // {found, chains, screened, audited} for transparency
   fresh:[], freshBlocked:[], freshUnverified:[], freshLoading:false, freshErr:null, freshCoverage:null,
-  heat:[], heatUnverified:[], heatLoading:false, heatErr:null, heatCoverage:null,
+  heat:[], heatUnverified:[], heatBlocked:[], heatLoading:false, heatErr:null, heatCoverage:null,
   watch:[], watchData:{}, watchLoading:false, watchErr:null, watchInput:"",
   wallets:[], walletInput:"",
   trades:[], tradesLoading:false, journalNote:null, expanded:{}, seenIntro:false,
@@ -1345,7 +1345,7 @@ function lookupOne(q){
 function runHeat(){
   fetchTrending();
   if(IS_LOCAL_FILE){S.localBlocked=true;render();return;}
-  S.heatLoading=true;S.heatErr=null;S.heat=[];S.heatUnverified=[];render();
+  S.heatLoading=true;S.heatErr=null;S.heat=[];S.heatUnverified=[];S.heatBlocked=[];render();
 
   var nets=S.chain==="all"
     ? GT_NETS.map(function(p){return p[0];})
@@ -1402,7 +1402,10 @@ function runHeat(){
               p._confirm=heatConfirmation(p);
               p._econ=tradeEconomics(p,p._sec);
               p._gate=gate(p,p._sec,p._econ);
-              if(p._gate.verdict==="block"){/* dropped */}
+              if(p._gate.verdict==="block"){
+                p._cv=conviction(p,p._sec,p._econ);
+                S.heatBlocked.push(p);
+              }
               else if(p._gate.verdict==="unverified"){
                 p._cv=conviction(p,p._sec,p._econ);S.heatUnverified.push(p);}
               else {p._cv=conviction(p,p._sec,p._econ);S.heat.push(p);}
@@ -1489,7 +1492,12 @@ function runFresh(){
               p._dump=dumpRisk(p,p._sec);
               p._econ=tradeEconomics(p,p._sec);
               p._gate=gate(p,p._sec,p._econ);
-              if(p._gate.verdict==="block")S.freshBlocked.push(p);
+              if(p._gate.verdict==="block"){
+                // score it so it can still be paper-tested — that is how you
+                // find out whether rejecting it was right
+                p._cv=conviction(p,p._sec,p._econ);
+                S.freshBlocked.push(p);
+              }
               else if(p._gate.verdict==="unverified"){
                 p._cv=conviction(p,p._sec,p._econ);S.freshUnverified.push(p);}
               else{p._cv=conviction(p,p._sec,p._econ);S.fresh.push(p);}
@@ -1603,6 +1611,7 @@ function logTrade(p,entryOverride,sizeOverride,paperMode){
         ageH: age, ageBand: age==null?"?": age<6?"<6h": age<24?"6-24h": age<72?"1-3d": age<336?"3-14d":">14d",
         verdict:(p._gate&&p._gate.verdict)||"?",
         trending:p._attn?(p._attn.confident?"yes":"ticker-only"):"no",
+        blockers:(p._gate&&Array.isArray(p._gate.blockers))?p._gate.blockers.slice(0,6):[],
         xAccounts:(p._social&&p._social.accounts!=null)?p._social.accounts:null,
         xNewPct:(p._social&&p._social.newPct!=null)?p._social.newPct:null,
         xBand:(p._social&&p._social.accounts!=null)
@@ -2000,6 +2009,144 @@ function learnFindings(){
 
 // Did rejecting these tokens actually help? Compares the paper-tested
 // rejects against the ones that passed. This is the app grading itself.
+// Which individual rules actually earned their keep? Aggregate numbers hide
+// this: your honeypot blocks may be flawless while your age rule costs you
+// money. Only rules you have paper-tested at least a few times are reported.
+function blockerAudit(){
+  var tested=S.trades.filter(function(t){
+    return t.status==="closed"&&t.blockedTest&&t.fp&&Array.isArray(t.fp.blockers)
+      &&t.fp.blockers.length&&isFinite(t.pnl)&&t.size>0;
+  });
+  if(!tested.length)return null;
+
+  var m={};
+  tested.forEach(function(t){
+    t.fp.blockers.forEach(function(b){
+      // normalise wordy blockers to a stable key
+      var k=String(b).split(" \u2014 ")[0].replace(/\s*\d+(\.\d+)?%?\s*$/,"").trim();
+      if(!k)return;
+      m[k]=m[k]||{n:0,sum:0,saved:0,cost:0};
+      var r=t.pnl/t.size;
+      m[k].n++; m[k].sum+=r;
+      if(r<0)m[k].saved++; else m[k].cost++;
+    });
+  });
+  var rows=Object.keys(m).map(function(k){
+    return {rule:k,n:m[k].n,avg:m[k].sum/m[k].n,
+      saved:m[k].saved,cost:m[k].cost,
+      rightPct:(m[k].saved/m[k].n)*100};
+  }).filter(function(r){return r.n>=2;});
+  rows.sort(function(a,b){return a.avg-b.avg;});   // most protective first
+  return {rows:rows,n:tested.length};
+}
+
+// Which rules may be adjusted from evidence, and which never may.
+//
+// The split is not about how confident the data looks. It is about what a
+// simulation can actually measure. A liquidity floor or an age window is a
+// preference — if the tokens it rejects keep running, the preference was
+// wrong and loosening it is reasonable.
+//
+// Contract-safety rules are different in kind. A honeypot that "went up" in
+// a paper trade would have been unsellable in reality: the simulation let you
+// exit when the contract would not have. So a costly-looking honeypot rule is
+// measuring fiction, and no amount of data can make loosening it correct.
+// These are excluded from adjustment entirely.
+var ADJUSTABLE={
+  "too new":       {k:"minAgeH", label:"Minimum age", ease:function(c){return {minAgeH:Math.max(0,c.minAgeH/2)};},
+                    describe:function(c){return "minimum age "+c.minAgeH+"h \u2192 "+Math.max(0,c.minAgeH/2)+"h";}},
+  "thin for your size": {k:"liqMultiple", label:"Liquidity requirement",
+                    ease:function(c){return {liqMultiple:Math.max(10,Math.round(c.liqMultiple*0.7))};},
+                    describe:function(c){return "liquidity requirement "+c.liqMultiple+"x \u2192 "+Math.max(10,Math.round(c.liqMultiple*0.7))+"x stake";}},
+  "low volume":    {k:"minVol", label:"Volume floor",
+                    ease:function(c){return {minVol:Math.max(1000,Math.round(c.minVol*0.6))};},
+                    describe:function(c){return "volume floor "+usd(c.minVol)+" \u2192 "+usd(Math.max(1000,Math.round(c.minVol*0.6)));}},
+  "holder concentration": {k:"maxTop10", label:"Holder concentration limit",
+                    ease:function(c){return {maxTop10:Math.min(60,c.maxTop10+8)};},
+                    describe:function(c){return "top-10 limit "+c.maxTop10+"% \u2192 "+Math.min(60,c.maxTop10+8)+"%";}}
+};
+// Anything containing these is a contract-safety rule and is never adjustable.
+var NEVER_ADJUST=["honeypot","sell","mint","freeze","blacklist","pausable","owner",
+  "selfdestruct","source","lp","liquidity unlock","authority","upgradable","proxy","rugcheck","tax"];
+
+function ruleAdjustable(rule){
+  var low=String(rule).toLowerCase();
+  for(var i=0;i<NEVER_ADJUST.length;i++)
+    if(low.indexOf(NEVER_ADJUST[i])>=0)return null;
+  var keys=Object.keys(ADJUSTABLE);
+  for(var j=0;j<keys.length;j++)
+    if(low.indexOf(keys[j])>=0)return ADJUSTABLE[keys[j]];
+  return null;
+}
+
+function blockerAuditHTML(){
+  var b=blockerAudit();
+  if(!b||!b.rows.length)
+    return '<div class="banner info"><b>Which rules are right?</b><br><br>'+
+      'Paper-test a few rejected tokens and this breaks the answer down rule by rule \u2014 whether '+
+      'each individual block saved you money or cost you money.</div>';
+
+  var h='<div class="banner info"><b>\u2696\ufe0f Rule-by-rule verdict \u00b7 '+b.n+' rejects tested</b><br><br>'+
+    'For each rule that fired, what happened to the tokens it rejected. Negative means the rule '+
+    'protected you.</div>';
+
+  h+='<div class="factors" style="margin:0 18px 12px"><div class="hd"><span>Rule</span>'+
+    '<span>avg outcome</span></div>';
+  b.rows.forEach(function(r){
+    var good=r.avg<0;
+    h+='<div class="fac"><span class="fl">'+esc(r.rule)+
+      '<br><span style="color:var(--dim);font-size:12px">'+r.saved+' of '+r.n+' would have lost</span></span>'+
+      '<span class="fw" style="color:'+(good?"var(--frog)":"var(--red)")+'">'+
+      (good?"protective":"costly")+'</span>'+
+      '<span class="fv" style="color:'+(good?"var(--frog)":"var(--red)")+';width:auto">'+
+      (r.avg>=0?"+":"")+(r.avg*100).toFixed(0)+'%</span></div>';
+  });
+  h+='</div>';
+
+  var costly=b.rows.filter(function(r){return r.avg>0.1&&r.n>=3;});
+
+  // one-tap loosening, for preference rules only
+  var tunable=costly.map(function(r){
+    return {r:r,adj:ruleAdjustable(r.rule)};
+  }).filter(function(x){return !!x.adj;});
+  if(tunable.length){
+    h+='<div style="margin:0 18px 12px;padding:14px;border-radius:11px;border:1.5px solid var(--frog);'+
+      'background:rgba(110,232,90,.05)">'+
+      '<div style="font-size:13px;text-transform:uppercase;letter-spacing:.08em;font-weight:800;'+
+      'color:var(--frog)">Act on this</div>'+
+      '<div style="margin-top:8px;font-size:14px;line-height:1.65;color:var(--text2)">'+
+      'These are preference rules, not safety checks \u2014 your results say they are rejecting '+
+      'tokens that went on to rise. Loosening one changes what you get offered from the next scan.</div>';
+    tunable.forEach(function(x){
+      h+='<div class="toolbar" style="padding:11px 0 0;border:none">'+
+        '<button class="primary" data-ease="'+esc(x.r.rule)+'">Loosen: '+esc(x.adj.describe(S.cfg))+'</button></div>';
+    });
+    h+='</div>';
+  }
+
+  var locked=costly.filter(function(r){return !ruleAdjustable(r.rule);});
+  if(locked.length){
+    h+='<div style="margin:0 18px 12px;padding:14px;border-radius:11px;border:1px solid var(--line);'+
+      'font-size:13.5px;line-height:1.65;color:var(--dim)">'+
+      '<b style="color:var(--text2)">Not adjustable:</b> '+
+      locked.map(function(r){return esc(r.rule);}).join(", ")+'.<br><br>'+
+      'These are contract-safety rules. A rejected token that rose in simulation would still have '+
+      'been unsellable in reality \u2014 the paper trade let you exit when the contract would not have. '+
+      'That apparent cost is fictional, so no result can justify switching them off.</div>';
+  }
+
+  if(costly.length){
+    h+='<div style="margin:0 18px 12px;padding:14px;border-radius:11px;border:1.5px solid var(--amber);'+
+      'background:rgba(255,194,77,.06);font-size:14.5px;line-height:1.7;color:var(--text2)">'+
+      '<b style="color:var(--amber)">These rules may be too strict:</b> '+
+      costly.map(function(r){return esc(r.rule);}).join(", ")+'. Tokens they rejected went up on '+
+      'average.<br><br><span style="color:var(--dim);font-size:13px">Loosen with care, and never for '+
+      'a contract-safety rule \u2014 a honeypot that happened to rise in a simulation would still have '+
+      'been unsellable in reality.</span></div>';
+  }
+  return h;
+}
+
 function filterAuditHTML(){
   var closed=S.trades.filter(function(t){return t.status==="closed"&&isFinite(t.pnl);});
   var blocked=closed.filter(function(t){return t.blockedTest;});
@@ -2257,6 +2404,28 @@ function walletPanelHTML(){
 // ===========================================================================
 function postMortem(t){
   if(t.status!=="closed"||!t.fp)return null;
+
+  // A rejected token you paper-tested gets its own verdict: was the block right?
+  if(t.blockedTest){
+    var why=(t.fp.blockers&&t.fp.blockers.length)?t.fp.blockers.join(", "):"a safety check";
+    var wonAnyway=t.pnl>0;
+    return {
+      tone:wonAnyway?"mixed":"win",
+      won:wonAnyway,
+      story:wonAnyway
+        ? "This was rejected for "+why+" \u2014 and it went up anyway. Blocking it cost you "+usd(t.pnl)+"."
+        : "This was rejected for "+why+" \u2014 and it lost "+usd(Math.abs(t.pnl))+". The block was right.",
+      lesson:wonAnyway
+        ? "One rejected token going up does not mean the rule is wrong; it means the rule has a cost, "+
+          "which every rule does. What matters is the average across all the rejects you test \u2014 "+
+          "the rule-by-rule breakdown in What\u2019s Working shows that.<br><br>"+
+          "<b>And note:</b> if the block was a contract-safety one \u2014 honeypot, mint authority, "+
+          "unlocked liquidity \u2014 this simulation let you sell at the top. In reality you may not "+
+          "have been able to sell at all, so treat this \u201cmissed gain\u201d as fictional."
+        : "The filter did its job here. Testing rejects like this is how you find out whether it "+
+          "keeps doing so, rather than trusting it on faith."
+    };
+  }
   var f=t.fp;
   var won=t.pnl>0;
   var hitTargets=(t.events||[]).filter(function(e){return e.kind==="tp";});
@@ -3850,6 +4019,15 @@ function cardHTML(p,isBlocked){
   h+='<div class="card-top"><div style="min-width:0;flex:1">'+
      '<div class="sym">'+esc(sym)+'<span class="chaintag">'+esc(chainName(p.chainId))+'</span></div>'+
      '<div class="name">'+esc(nm)+'</div></div>';
+  if(cv&&isBlocked){
+    // Blocked tokens still get their grade shown. The grade measures structure;
+    // the block is a separate safety judgement. Showing both lets you see when
+    // something well-built was rejected — which is exactly what the filter
+    // audit needs you to notice.
+    h+='<div class="gradebox" style="opacity:.75">'+
+      '<div class="grade" style="color:'+gradeColor(cv.grade)+'">'+esc(cv.grade)+'</div>'+
+      '<div class="gradelbl">setup</div></div>';
+  }
   if(cv&&!isBlocked){
     var col=gradeColor(cv.grade);
     h+='<div class="gradebox"><div class="grade" style="color:'+col+'">'+cv.grade+'</div>'+
@@ -4474,7 +4652,8 @@ function heatPane(){
   if(S.localBlocked)return h+localFileNotice();
   if(S.heatErr)return h+'<div class="banner err code">'+esc(S.heatErr)+'</div>';
   if(S.heatLoading)return h+'<div class="empty"><div class="spinner"></div>Checking build-ups\u2026</div>';
-  if(!rankAndFilter(S.heat).length&&!rankAndFilter(S.heatUnverified).length){
+  // don't bail out while there are rejected tokens worth paper-testing
+  if(!rankAndFilter(S.heat).length&&!rankAndFilter(S.heatUnverified).length&&!S.heatBlocked.length){
     if(S.heatCoverage)
       return h+'<div class="empty">Nothing is building right now.<br><br>'+
         'Scanned '+S.heatCoverage.found+' pairs; none showed compounding activity while still early. '+
@@ -4497,6 +4676,15 @@ function heatPane(){
       ' building but unverifiable</div><div style="margin-top:8px;font-size:14px;line-height:1.6;color:var(--text2)">'+
       'Activity is rising, but no security record exists yet. Unknown, not safe.</div></div>';
     rankAndFilter(S.heatUnverified).slice(0,10).forEach(function(p){h+=heatCard(p);});
+  }
+  if(S.heatBlocked.length&&!S.cfg.hideBlocked){
+    h+='<div style="margin:18px 18px 0;padding:14px;border-radius:12px;border:1px solid var(--red);'+
+      'background:rgba(255,107,122,.05)"><div style="font-size:14.5px;font-weight:800;color:var(--red)">'+
+      '\u26d4 '+S.heatBlocked.length+' rejected</div>'+
+      '<div style="margin-top:7px;font-size:13.5px;line-height:1.6;color:var(--text2)">'+
+      'Building, but failed a safety check. You can still paper-test them to find out whether the '+
+      'rejection was right.</div></div>';
+    S.heatBlocked.slice(0,8).forEach(function(p){h+=cardHTML(p,true);});
   }
   return h;
 }
@@ -5581,6 +5769,20 @@ function render(){
       S.cfg.tp=tp; saveCfg();
       S.journalNote=n2+" running trade"+(n2===1?"":"s")+" retargeted to "+
         tp.map(function(m){return m+"x";}).join(" / ")+", and new trades will use it too.";
+      render();
+    };});
+  Array.prototype.forEach.call(app.querySelectorAll("[data-ease]"),function(b){
+    b.onclick=function(){
+      var rule=b.getAttribute("data-ease");
+      var adj=ruleAdjustable(rule);
+      if(!adj)return;
+      var change=adj.ease(S.cfg);
+      var before=adj.describe(S.cfg);
+      Object.keys(change).forEach(function(k){S.cfg[k]=change[k];});
+      saveCfg();
+      S.journalNote="Loosened "+adj.label.toLowerCase()+" ("+before+"). "+
+        "Your next scan will surface tokens that were previously rejected \u2014 watch whether they "+
+        "actually perform, and tighten it back if they don\u2019t.";
       render();
     };});
   var al=document.getElementById("applyLadder");
