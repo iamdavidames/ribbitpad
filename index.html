@@ -1135,6 +1135,7 @@ function preScreen(p){
 }
 
 function runScan(){
+  fetchTrending();
   if(IS_LOCAL_FILE){ S.localBlocked=true; S.error=null; render(); return; }
   S.loading=true;S.error=null;S.localBlocked=false;S.passed=[];S.blocked=[];S.pct=0;
   S.progress="Sweeping every chain…";render();
@@ -1282,6 +1283,8 @@ function runScan(){
 
     function finish(){
       if(finished)return; finished=true;
+      S.passed.concat(S.unverified).forEach(function(p){p._attn=attentionFor(p);});
+      socialEnrich(S.passed.concat(S.unverified));
       shadowRecord(S.passed.concat(S.unverified));
       S.passed.sort(function(a,b){return b._cv.total-a._cv.total;});
       S.loading=false;S.progress="";S.pct=100;S.lastFetch=Date.now();render();
@@ -1324,6 +1327,8 @@ function lookupOne(q){
         p._sec=sec;snapRecord(p,sec);p._dump=dumpRisk(p,sec);
         p._econ=tradeEconomics(p,sec);
         p._gate=gate(p,sec,p._econ,{safetyOnly:true});p._cv=conviction(p,sec,p._econ);
+        p._attn=attentionFor(p);
+        socialFetch(p).then(function(d){if(d){p._social=d;render();}});
         S.lookup=p;S.lookupLoading=false;render();
       });
     }).catch(function(e){
@@ -1338,6 +1343,7 @@ function lookupOne(q){
 // floor, never a safety check.
 // ===========================================================================
 function runHeat(){
+  fetchTrending();
   if(IS_LOCAL_FILE){S.localBlocked=true;render();return;}
   S.heatLoading=true;S.heatErr=null;S.heat=[];S.heatUnverified=[];render();
 
@@ -1378,6 +1384,8 @@ function runHeat(){
 
     var i=0,active=0,CONC=3,fin=false;
     function done(){if(fin)return;fin=true;
+      S.heat.concat(S.heatUnverified).forEach(function(p){p._attn=attentionFor(p);});
+      socialEnrich(S.heat.concat(S.heatUnverified));
       shadowRecord(S.heat.concat(S.heatUnverified));
       S.heat.sort(function(a,b){return b._heat.score-a._heat.score;});
       S.heatLoading=false;render();}
@@ -1461,6 +1469,8 @@ function runFresh(){
 
     var i=0,active=0,CONC=3,fin=false;
     function done(){ if(fin)return;fin=true;
+      S.fresh.concat(S.freshUnverified).forEach(function(p){p._attn=attentionFor(p);});
+      socialEnrich(S.fresh.concat(S.freshUnverified));
       shadowRecord(S.fresh.concat(S.freshUnverified));
       if(S.cfg.freshSortBySurge!==false)
         S.fresh.sort(function(a,b){return (b._surgeScore||0)-(a._surgeScore||0);});
@@ -1592,6 +1602,12 @@ function logTrade(p,entryOverride,sizeOverride,paperMode){
         liqRatio: fdv>0?liq/fdv:0,
         ageH: age, ageBand: age==null?"?": age<6?"<6h": age<24?"6-24h": age<72?"1-3d": age<336?"3-14d":">14d",
         verdict:(p._gate&&p._gate.verdict)||"?",
+        trending:p._attn?(p._attn.confident?"yes":"ticker-only"):"no",
+        xAccounts:(p._social&&p._social.accounts!=null)?p._social.accounts:null,
+        xNewPct:(p._social&&p._social.newPct!=null)?p._social.newPct:null,
+        xBand:(p._social&&p._social.accounts!=null)
+          ? (p._social.accounts>=25?"busy":p._social.accounts>=8?"some":"quiet") : null,
+        trendRank:p._attn?p._attn.rank:null,
         dumpFlags:(p._dump&&p._dump.flags.filter(function(x){return x.s!=="ok";}).length)||0,
         profile:(function(){var pm=profileMatch(p);return pm?pm.n:null;})(),
         accel:Math.round(f.accel||0), turn:Math.round(f.turn||0), room:Math.round(f.room||0),
@@ -1948,7 +1964,9 @@ function learnBuckets(){
     byAge:group(function(f){return f.ageBand;},"Age when you bought"),
     byProfile:group(function(f){return f.profile==null?null:(f.profile>=5?"5-6 traits":f.profile>=3?"3-4 traits":"0-2 traits");},"Parabolic profile match"),
     byHeat:group(function(f){return f.heat==null?null:(f.heat>=60?"heat 60+":f.heat>=35?"heat 35-59":"heat <35");},"Heat score"),
-    byVerdict:group(function(f){return f.verdict;},"Safety verdict")
+    byVerdict:group(function(f){return f.verdict;},"Safety verdict"),
+    byTrending:group(function(f){return f.trending;},"Trending when you bought"),
+    byX:group(function(f){return f.xBand;},"X activity when you bought")
   };
 }
 
@@ -2055,7 +2073,7 @@ function learnPanelHTML(){
   }
 
   // the raw tables, always shown
-  [b.byGrade,b.byProfile,b.byHeat,b.byFdv,b.byAge,b.byChain,b.byVerdict].forEach(function(gr){
+  [b.byGrade,b.byProfile,b.byHeat,b.byTrending,b.byX,b.byFdv,b.byAge,b.byChain,b.byVerdict].forEach(function(gr){
     if(!gr.rows.length)return;
     h+='<div class="factors" style="margin:0 18px 12px"><div class="hd"><span>'+esc(gr.label)+
       '</span><span>expectancy</span></div>';
@@ -2502,7 +2520,7 @@ function replayLadder(t,tp){
 
 function ladderBacktest(){
   var closed=S.trades.filter(function(t){
-    return t.status==="closed"&&isFinite(t.peak)&&t.peak>0&&t.size>0;
+    return t.status==="closed"&&isFinite(t.peak)&&t.peak>0&&t.size>0&&!t.retargeted;
   });
   if(closed.length<8)return {ready:false,n:closed.length};
 
@@ -2530,6 +2548,211 @@ function ladderBacktest(){
   });
 
   return {ready:true,n:closed.length,results:results,current:current,reach:reach,total:closed.length};
+}
+
+// Apply a new exit ladder to trades already running. Marked as retargeted,
+// because a trade whose plan changed midway no longer tells you what your
+// original rules would have produced — and the ladder backtest excludes them
+// for exactly that reason.
+function retargetOpen(tp){
+  if(!tp||!tp.length)return 0;
+  var changed=0;
+  S.trades.forEach(function(t){
+    if(t.status!=="open")return;
+    var already=(t.events||[]).filter(function(e){return e.kind==="tp";}).length;
+    // keep rungs already taken; only replace the ones still ahead
+    var newTp=tp.slice().sort(function(a,b){return a-b;});
+    if(already){
+      var hit=(t.events||[]).filter(function(e){return e.kind==="tp";})
+        .map(function(e){return e.mult;});
+      newTp=hit.concat(newTp.filter(function(m){return m>Math.max.apply(null,hit);}));
+    }
+    t.tps=newTp;
+    t.retargeted=true;
+    changed++;
+  });
+  if(changed)saveTrades();
+  return changed;
+}
+
+function retargetPanelHTML(){
+  var open=S.trades.filter(function(t){return t.status==="open";});
+  if(!open.length)return "";
+  var cur=S.cfg.tp.slice().sort(function(a,b){return a-b;});
+  var maxOpen=0;
+  open.forEach(function(t){
+    var m=Math.max.apply(null,t.tps||[0]);
+    if(m>maxOpen)maxOpen=m;
+  });
+
+  return '<div style="margin:16px 18px;border:1.5px solid var(--amber);border-radius:12px;overflow:hidden">'+
+    '<div style="padding:13px 14px;background:rgba(255,194,77,.07);font-size:12.5px;text-transform:uppercase;'+
+    'letter-spacing:.09em;font-weight:800;color:var(--amber)">Retarget '+open.length+' running trade'+
+    (open.length===1?"":"s")+'</div>'+
+    '<div style="padding:14px">'+
+    '<div style="font-size:14.5px;line-height:1.7;color:var(--text2)">'+
+    'Their highest target is currently '+maxOpen+'x. Lowering it means more of them finish, and finish '+
+    'sooner \u2014 which gets you usable data faster.<br><br>'+
+    '<b style="color:var(--amber)">The trade-off:</b> a trade whose plan changed partway through no longer '+
+    'shows what your original rules would have done. Retargeted trades are marked and left out of the '+
+    'exit-plan comparison so they cannot skew it.</div>'+
+    '<div class="toolbar" style="padding:12px 0 0;border:none;flex-wrap:wrap">'+
+    '<button class="primary" data-retarget="2,3,5">2x / 3x / 5x</button>'+
+    '<button data-retarget="2,4,6">2x / 4x / 6x</button>'+
+    '<button data-retarget="2,3">2x / 3x</button>'+
+    '</div>'+
+    '<div style="margin-top:10px;font-size:13px;color:var(--dim);line-height:1.6">'+
+    'Rungs already taken are kept \u2014 if a trade has sold at 2x, only the targets ahead of it change. '+
+    'Stops are untouched.</div>'+
+    '</div></div>';
+}
+
+// ===========================================================================
+// PROGRESS  —  are you actually getting better?
+//
+// Splits your resolved trades into an early cohort and a recent one and
+// compares them. The hard part is attribution: if results got worse, was that
+// you or the market? Shadow tracking answers it. If everything the scanner
+// surfaced got worse in the same period, conditions changed. If only your
+// picks got worse while the pool held up, that is selection.
+// ===========================================================================
+function progressReport(){
+  var closed=S.trades.filter(function(t){
+    return t.status==="closed"&&isFinite(t.pnl)&&t.size>0;
+  }).sort(function(a,b){return (a.exitAt||a.opened)-(b.exitAt||b.opened);});
+
+  if(closed.length<10)return {ready:false,n:closed.length};
+
+  var half=Math.floor(closed.length/2);
+  var early=closed.slice(0,half), recent=closed.slice(half);
+
+  function sum(arr){
+    var r=arr.reduce(function(a,t){return a+t.pnl/t.size;},0)/arr.length;
+    var w=arr.filter(function(t){return t.pnl>0;}).length;
+    var avgGrade=arr.reduce(function(a,t){
+      return a+((t.fp&&t.fp.score)||t.score||0);},0)/arr.length;
+    return {n:arr.length,exp:r,winRate:(w/arr.length)*100,wins:w,avgScore:avgGrade,
+      totalPnl:arr.reduce(function(a,t){return a+t.pnl;},0)};
+  }
+  var E=sum(early), R=sum(recent);
+  var delta=R.exp-E.exp;
+
+  // Did the pool itself get harder? Compare shadow peaks over the same split.
+  var poolShift=null;
+  try{
+    var o=shadowLoad(), keys=Object.keys(o);
+    if(keys.length>=12){
+      var arr=keys.map(function(k){return o[k];})
+        .filter(function(x){return x.p0>0&&x.seen>1;})
+        .sort(function(a,b){return a.t-b.t;});
+      if(arr.length>=12){
+        var h2=Math.floor(arr.length/2);
+        var pe=arr.slice(0,h2), pr=arr.slice(h2);
+        var m=function(a){return a.reduce(function(s,x){return s+x.peak/x.p0;},0)/a.length;};
+        poolShift={early:m(pe),recent:m(pr),delta:m(pr)-m(pe)};
+      }
+    }
+  }catch(e){}
+
+  // Diagnosis
+  var verdict,reason;
+  var improving=delta>0.03, declining=delta<-0.03;
+  if(improving){
+    verdict="improving";
+    reason="Your recent trades are returning "+(delta*100).toFixed(0)+
+      " points more per dollar than your early ones.";
+  } else if(!declining){
+    verdict="flat";
+    reason="Recent results are close to your early ones. At this sample size that is the "+
+      "most common outcome and does not mean nothing is working \u2014 it means the difference, "+
+      "if any, is smaller than the noise.";
+  } else {
+    verdict="declining";
+    if(poolShift&&poolShift.delta<-0.15){
+      reason="Results are down, but so is everything the scanner surfaced \u2014 average peak across "+
+        "all tracked candidates fell from "+poolShift.early.toFixed(2)+"x to "+poolShift.recent.toFixed(2)+
+        "x over the same period. That points at conditions, not at your picking.";
+    } else if(R.avgScore<E.avgScore-4){
+      reason="Results are down and so is the quality of what you have been taking \u2014 average setup "+
+        "score fell from "+E.avgScore.toFixed(0)+" to "+R.avgScore.toFixed(0)+
+        ". Loosening standards is the usual cause, and the usual fix is raising the grade floor back.";
+    } else if(poolShift&&poolShift.delta>-0.05){
+      reason="Results are down while the wider pool held up. That points at selection rather than "+
+        "conditions \u2014 worth checking the What\u2019s Working breakdown for which categories turned.";
+    } else {
+      reason="Results are down. Not enough context yet to say whether that is conditions or selection; "+
+        "keep scanning so the shadow pool has something to compare against.";
+    }
+  }
+
+  return {ready:true,n:closed.length,early:E,recent:R,delta:delta,
+    verdict:verdict,reason:reason,poolShift:poolShift,
+    series:closed.map(function(t,i){
+      var win=closed.slice(0,i+1).filter(function(x){return x.pnl>0;}).length;
+      return {i:i+1,rate:(win/(i+1))*100,exp:closed.slice(0,i+1)
+        .reduce(function(a,x){return a+x.pnl/x.size;},0)/(i+1)};
+    })};
+}
+
+function progressPanelHTML(){
+  var p=progressReport();
+  if(!p.ready)
+    return '<div class="banner info"><b>\ud83d\udcc8 Progress tracking</b><br><br>'+
+      'Once 10 trades resolve, this compares your recent results against your early ones and \u2014 '+
+      'more usefully \u2014 tries to work out <i>why</i> they moved. '+p.n+' of 10 so far.</div>';
+
+  var col=p.verdict==="improving"?"var(--frog)":p.verdict==="declining"?"var(--red)":"var(--amber)";
+  var icon=p.verdict==="improving"?"\u2197":p.verdict==="declining"?"\u2198":"\u2192";
+
+  var h='<div style="margin:16px 18px;border:2px solid '+col+';border-radius:13px;overflow:hidden">'+
+    '<div style="padding:14px;background:rgba(255,255,255,.03);font-size:12.5px;text-transform:uppercase;'+
+    'letter-spacing:.09em;font-weight:800;color:'+col+'">'+icon+' '+esc(p.verdict)+
+    ' \u00b7 '+p.n+' resolved</div><div style="padding:16px">'+
+
+    '<div style="display:flex;gap:9px">'+
+    '<div style="flex:1;padding:11px;border-radius:9px;background:var(--panel);border:1px solid var(--line)">'+
+      '<div style="font-size:10.5px;color:var(--dim);text-transform:uppercase">First '+p.early.n+'</div>'+
+      '<div class="mono" style="font-size:17px;font-weight:800;margin-top:4px;color:'+
+      (p.early.exp>=0?"var(--frog)":"var(--red)")+'">'+(p.early.exp>=0?"+":"")+(p.early.exp*100).toFixed(0)+'%</div>'+
+      '<div style="font-size:11.5px;color:var(--dim);margin-top:2px">'+p.early.winRate.toFixed(0)+'% win</div></div>'+
+    '<div style="flex:1;padding:11px;border-radius:9px;background:var(--panel);border:1px solid var(--line)">'+
+      '<div style="font-size:10.5px;color:var(--dim);text-transform:uppercase">Last '+p.recent.n+'</div>'+
+      '<div class="mono" style="font-size:17px;font-weight:800;margin-top:4px;color:'+
+      (p.recent.exp>=0?"var(--frog)":"var(--red)")+'">'+(p.recent.exp>=0?"+":"")+(p.recent.exp*100).toFixed(0)+'%</div>'+
+      '<div style="font-size:11.5px;color:var(--dim);margin-top:2px">'+p.recent.winRate.toFixed(0)+'% win</div></div>'+
+    '<div style="flex:1;padding:11px;border-radius:9px;background:var(--panel);border:1px solid var(--line)">'+
+      '<div style="font-size:10.5px;color:var(--dim);text-transform:uppercase">Change</div>'+
+      '<div class="mono" style="font-size:17px;font-weight:800;margin-top:4px;color:'+col+'">'+
+      (p.delta>=0?"+":"")+(p.delta*100).toFixed(0)+'</div>'+
+      '<div style="font-size:11.5px;color:var(--dim);margin-top:2px">points</div></div>'+
+    '</div>';
+
+  h+='<div style="margin-top:13px;font-size:14.5px;line-height:1.7;color:var(--text2)">'+
+    '<b style="color:'+col+'">Why:</b> '+p.reason+'</div>';
+
+  if(p.n<30)
+    h+='<div style="margin-top:11px;font-size:13.5px;line-height:1.65;color:var(--amber)">'+
+      'With '+p.n+' trades, a swing of this size can happen by chance alone. Two or three outcomes '+
+      'either way would flip this reading. Treat it as a weak signal until you are past 30.</div>';
+
+  h+='</div></div>';
+
+  // running expectancy curve
+  if(p.series.length>=4){
+    var pts=p.series.map(function(x){return {v:x.exp*100};});
+    h+='<div style="margin:0 18px 16px;border:1px solid var(--line);border-radius:13px;overflow:hidden">'+
+      '<div style="padding:13px 14px;background:var(--raised);display:flex;justify-content:space-between">'+
+      '<span style="font-size:12px;text-transform:uppercase;letter-spacing:.09em;color:var(--text2);'+
+      'font-weight:800">Running return per dollar</span>'+
+      '<span class="mono" style="font-size:15px;font-weight:800;color:'+
+      (p.series[p.series.length-1].exp>=0?"var(--frog)":"var(--red)")+'">'+
+      (p.series[p.series.length-1].exp>=0?"+":"")+(p.series[p.series.length-1].exp*100).toFixed(0)+'%</span></div>'+
+      lineChartHTML(pts,{height:150,baseline:0})+
+      '<div style="padding:10px 14px;font-size:13px;color:var(--dim);line-height:1.6">'+
+      'Average return per dollar staked, recalculated after every trade. Flattening out is what a '+
+      'stable edge looks like; a line still swinging wildly means the sample is too small to read.</div></div>';
+  }
+  return h;
 }
 
 function ladderPanelHTML(){
@@ -2624,7 +2847,8 @@ function fitModel(){
     fdv:bucketStats(function(f){return f.fdvBand;}),
     age:bucketStats(function(f){return f.ageBand;}),
     profile:bucketStats(function(f){return f.profile==null?null:(f.profile>=5?"hi":f.profile>=3?"mid":"lo");}),
-    heat:bucketStats(function(f){return f.heat==null?null:(f.heat>=60?"hi":f.heat>=35?"mid":"lo");})
+    heat:bucketStats(function(f){return f.heat==null?null:(f.heat>=60?"hi":f.heat>=35?"mid":"lo");}),
+    trending:bucketStats(function(f){return f.trending||null;})
   };
 }
 
@@ -2651,6 +2875,8 @@ function fitScore(p,model){
   add(model.age,ageBand,ageBand+" old");
   add(model.profile,profBand,profBand==="hi"?"strong profile match":profBand==="mid"?"partial profile match":"weak profile match");
   add(model.heat,heatBand,heatBand==="hi"?"high heat":heatBand==="mid"?"moderate heat":"low heat");
+  var at=p._attn?(p._attn.confident?"yes":"ticker-only"):"no";
+  add(model.trending,at,at==="no"?"not trending":"trending");
 
   if(!parts.length)return null;
   // average the edges, then convert to points and cap
@@ -2693,6 +2919,260 @@ function fitHTML(p){
 var SHADOW_KEY="rp:shadow";
 var SHADOW_MAX=400;
 var SHADOW_TTL=14*24*3600*1000;
+
+// ===========================================================================
+// ATTENTION SIGNAL
+//
+// CoinGecko publishes what people are actually searching for, which is the
+// closest thing to a real trending feed available without paid infrastructure.
+// It is fetched once every few minutes and cross-referenced against scanned
+// tokens by contract address and symbol.
+//
+// Deliberately NOT treated as bullish by default. Attention is recorded onto
+// the fingerprint like any other attribute, so the learning models can work
+// out from your own results whether being trending helped or hurt. My guess
+// is that by the time something trends on CoinGecko the move is mostly done —
+// but a guess is exactly what this is designed to replace.
+// ===========================================================================
+var TRENDING={at:0, coins:[], byAddr:{}, bySym:{}, loading:false, err:null};
+var TRENDING_TTL=5*60*1000;
+
+function fetchTrending(force){
+  if(TRENDING.loading)return Promise.resolve(TRENDING);
+  if(!force&&Date.now()-TRENDING.at<TRENDING_TTL&&TRENDING.coins.length)
+    return Promise.resolve(TRENDING);
+  TRENDING.loading=true;
+  return fetchJSON(CG+"/search/trending",9000).then(function(d){
+    var coins=[],byAddr={},bySym={};
+    ((d&&d.coins)||[]).forEach(function(c,i){
+      var it=(c&&c.item)||{};
+      var entry={
+        id:it.id||"", name:it.name||"", sym:(it.symbol||"").toUpperCase(),
+        rank:i+1, mcapRank:it.market_cap_rank||null,
+        score:it.score!=null?it.score:i
+      };
+      coins.push(entry);
+      if(entry.sym)bySym[entry.sym]=entry;
+      // some responses carry platform contract addresses
+      var plats=it.platforms||{};
+      Object.keys(plats).forEach(function(k){
+        var a=plats[k];
+        if(a&&typeof a==="string")byAddr[a.toLowerCase()]=entry;
+      });
+    });
+    // Mutate in place rather than reassigning — anything holding a reference
+    // to TRENDING would otherwise keep pointing at the stale object.
+    TRENDING.at=Date.now(); TRENDING.coins=coins;
+    TRENDING.byAddr=byAddr; TRENDING.bySym=bySym;
+    TRENDING.loading=false; TRENDING.err=null;
+    return TRENDING;
+  }).catch(function(e){
+    TRENDING.loading=false;
+    TRENDING.err=(e&&e.message)||"could not load trending";
+    return TRENDING;
+  });
+}
+
+// Is this token currently getting search attention?
+function attentionFor(p){
+  if(!p||!p.baseToken)return null;
+  var addr=String(p.baseToken.address||"").toLowerCase();
+  var sym=String(p.baseToken.symbol||"").toUpperCase();
+  var hit=TRENDING.byAddr[addr]||null;
+  var matchedBy="address";
+  if(!hit&&sym&&sym.length>=3){
+    hit=TRENDING.bySym[sym]||null;
+    matchedBy="symbol";
+  }
+  if(!hit)return null;
+  return {
+    rank:hit.rank, name:hit.name, sym:hit.sym,
+    matchedBy:matchedBy,
+    // a symbol match on a microcap is weak evidence — tickers collide constantly
+    confident:matchedBy==="address"
+  };
+}
+
+function attentionHTML(p){
+  var a=p._attn;
+  if(!a)return "";
+  return '<div style="margin-top:12px;padding:12px 13px;border-radius:10px;border:1px solid var(--blue);'+
+    'background:rgba(93,169,255,.06)">'+
+    '<div style="font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:800;color:var(--blue)">'+
+    '\ud83d\udcc8 Trending on CoinGecko \u00b7 #'+a.rank+'</div>'+
+    '<div style="margin-top:7px;font-size:13.5px;line-height:1.65;color:var(--text2)">'+
+    (a.confident
+      ? 'Matched by contract address, so this is the same token.'
+      : 'Matched by ticker <b>'+esc(a.sym)+'</b> only \u2014 tickers collide constantly, so this may '+
+        'be a different project with the same symbol.')+
+    '<br><br><span style="color:var(--dim);font-size:13px">Attention is recorded, not rewarded. '+
+    'Whether trending helps or hurts gets measured against your own results in What\u2019s Working.</span>'+
+    '</div></div>';
+}
+
+// ===========================================================================
+// SOCIAL ADAPTER  —  extension point for X / Twitter data
+//
+// The app never calls X directly: a static page has no server to hold an API
+// key, and X blocks cross-origin browser requests. But if you (or another AI)
+// wire up a proxy or serverless function, define an adapter here and the app
+// will use it everywhere automatically.
+//
+// TO IMPLEMENT: define window.RIBBIT_X before this script runs, or assign it
+// at any time afterwards. Shape:
+//
+//   window.RIBBIT_X = {
+//     // Required. Called with the token being examined.
+//     // MUST return a Promise. MUST NOT throw. Resolve null if nothing found.
+//     fetch: function(token) {
+//       // token = { chain, address, symbol, name }
+//       // ... your call to a proxy that holds the X API key ...
+//       return Promise.resolve({
+//         mentions24h:   42,      // number of posts in last 24h
+//         accounts24h:   18,      // distinct accounts posting
+//         medianFollowers: 850,   // median follower count of those accounts
+//         newAccountPct: 40,      // % of posting accounts created <30d ago
+//         sentiment:     0.3,     // -1..+1, optional, null if unknown
+//         topPost:      "https://x.com/..."  // optional
+//       });
+//     },
+//     name: "Grok X adapter"    // optional, shown in Settings
+//   };
+//
+// Every field is optional except that the whole thing may be null. Missing
+// fields are treated as unknown, never as zero.
+//
+// IMPORTANT: results are recorded onto the trade fingerprint and measured
+// against your outcomes like any other attribute. They do not directly raise
+// or lower a grade. That is deliberate — social volume is trivially faked by
+// the people launching these tokens, so it has to earn its influence from
+// your results rather than being trusted on arrival.
+// ===========================================================================
+var SOCIAL={cache:{}, inflight:{}, enabled:false};
+
+function socialAdapter(){
+  try{
+    if(typeof window!=="undefined"&&window.RIBBIT_X&&typeof window.RIBBIT_X.fetch==="function")
+      return window.RIBBIT_X;
+  }catch(e){}
+  return null;
+}
+
+function socialKey(p){
+  return (p.chainId||"")+":"+String((p.baseToken&&p.baseToken.address)||"").toLowerCase();
+}
+
+// Fetch social data for a token, cached for 10 minutes. Never throws, never
+// blocks rendering — the result arrives later and the card re-renders.
+function socialFetch(p){
+  var ad=socialAdapter(); if(!ad)return Promise.resolve(null);
+  var k=socialKey(p);
+  var c=SOCIAL.cache[k];
+  if(c&&Date.now()-c.at<600000)return Promise.resolve(c.data);
+  if(SOCIAL.inflight[k])return SOCIAL.inflight[k];
+
+  var req;
+  try{
+    req=Promise.resolve(ad.fetch({
+      chain:p.chainId,
+      address:(p.baseToken&&p.baseToken.address)||"",
+      symbol:(p.baseToken&&p.baseToken.symbol)||"",
+      name:(p.baseToken&&p.baseToken.name)||""
+    }));
+  }catch(e){ req=Promise.resolve(null); }
+
+  SOCIAL.inflight[k]=req.then(function(d){
+    var clean=null;
+    // isFinite(null) is true in JS, so a missing field would silently become 0
+    // — which reads as "nobody is talking about this" rather than "unknown".
+    // Those mean very different things, so check the type explicitly.
+    function numOrNull(x){
+      if(x===null||x===undefined||x==="")return null;
+      var v=Number(x);
+      return isFinite(v)?v:null;
+    }
+    if(d&&typeof d==="object"){
+      clean={
+        mentions:numOrNull(d.mentions24h),
+        accounts:numOrNull(d.accounts24h),
+        followers:numOrNull(d.medianFollowers),
+        newPct:numOrNull(d.newAccountPct),
+        sentiment:numOrNull(d.sentiment),
+        topPost:(typeof d.topPost==="string")?d.topPost:null
+      };
+      // if literally nothing usable came back, treat it as no data at all
+      var got=["mentions","accounts","followers","newPct","sentiment"].filter(function(k){
+        return clean[k]!==null;});
+      if(!got.length&&!clean.topPost)clean=null;
+    }
+    SOCIAL.cache[k]={at:Date.now(),data:clean};
+    delete SOCIAL.inflight[k];
+    return clean;
+  }).catch(function(){
+    SOCIAL.cache[k]={at:Date.now(),data:null};
+    delete SOCIAL.inflight[k];
+    return null;
+  });
+  return SOCIAL.inflight[k];
+}
+
+// Attach social data to a list of tokens, then re-render once when done.
+function socialEnrich(list){
+  if(!socialAdapter()||!list||!list.length)return;
+  var pending=0, any=false;
+  list.slice(0,25).forEach(function(p){
+    pending++;
+    socialFetch(p).then(function(d){
+      if(d){p._social=d;any=true;}
+      if(--pending<=0&&any)render();
+    });
+  });
+}
+
+// Read the numbers honestly. High mention counts from brand-new accounts are
+// a manufactured-hype signal, not a bullish one.
+function socialReadout(s){
+  if(!s)return null;
+  var flags=[];
+  if(s.newPct!=null&&s.newPct>=60)
+    flags.push({s:"bad",t:Math.round(s.newPct)+"% of accounts posting were created in the last month \u2014 that pattern is what a paid campaign looks like"});
+  else if(s.newPct!=null&&s.newPct>=35)
+    flags.push({s:"wr",t:Math.round(s.newPct)+"% of posting accounts are new"});
+  if(s.followers!=null&&s.followers<200&&s.mentions!=null&&s.mentions>20)
+    flags.push({s:"wr",t:"Lots of posts but median follower count is only "+Math.round(s.followers)});
+  if(s.accounts!=null&&s.mentions!=null&&s.accounts>0&&(s.mentions/s.accounts)>8)
+    flags.push({s:"wr",t:"About "+Math.round(s.mentions/s.accounts)+" posts per account \u2014 a few people repeating themselves"});
+  if(s.accounts!=null&&s.accounts>=25&&(s.newPct==null||s.newPct<35))
+    flags.push({s:"ok",t:s.accounts+" distinct accounts, mostly established"});
+  return flags;
+}
+
+function socialHTMLBlock(p){
+  var s=p._social; if(!s)return "";
+  var flags=socialReadout(s)||[];
+  var bad=flags.filter(function(f){return f.s==="bad";}).length;
+  var col=bad?"var(--red)":flags.some(function(f){return f.s==="wr";})?"var(--amber)":"var(--frog)";
+  var h='<div style="margin-top:12px;border:1px solid '+col+';border-radius:10px;overflow:hidden">'+
+    '<div style="padding:11px 13px;background:rgba(255,255,255,.03);font-size:12px;text-transform:uppercase;'+
+    'letter-spacing:.08em;font-weight:800;color:'+col+'">\ud835\udd4f activity</div><div style="padding:12px 13px">'+
+    '<div style="display:flex;gap:8px;flex-wrap:wrap;font-family:var(--mono);font-size:13px;color:var(--text2)">'+
+    (s.mentions!=null?'<span>'+s.mentions+' posts/24h</span>':'')+
+    (s.accounts!=null?'<span>\u00b7 '+s.accounts+' accounts</span>':'')+
+    (s.followers!=null?'<span>\u00b7 median '+Math.round(s.followers)+' followers</span>':'')+
+    '</div>';
+  flags.forEach(function(f){
+    var c=f.s==="bad"?"var(--red)":f.s==="wr"?"var(--amber)":"var(--frog)";
+    var ic=f.s==="bad"?"\u2715":f.s==="wr"?"!":"\u2713";
+    h+='<div class="chk" style="padding-left:0"><span class="ic" style="color:'+c+'">'+ic+'</span>'+
+       '<span class="tx" style="color:'+c+'">'+esc(f.t)+'</span></div>';
+  });
+  if(s.topPost)
+    h+='<div class="links" style="margin-top:8px"><a href="'+esc(s.topPost)+'" target="_blank" rel="noopener">Top post \u2197</a></div>';
+  h+='<div style="margin-top:9px;font-size:12.5px;color:var(--dim);line-height:1.6">'+
+    'Recorded and measured against your results \u2014 it does not raise or lower the grade directly, '+
+    'because social volume is easy to manufacture.</div>';
+  return h+'</div></div>';
+}
 
 function shadowLoad(){
   if(!LS_OK)return {};
@@ -3465,6 +3945,8 @@ function cardHTML(p,isBlocked){
     h+='</div>';
   }
 
+  h+=socialHTMLBlock(p);
+  h+=attentionHTML(p);
   h+=fitHTML(p);
   h+=dumpRiskHTML(p);
   if(!isBlocked) h+=socialHTML(p);
@@ -4183,7 +4665,7 @@ function journalPane(){
 
   if(S.showStats){
     return '<div class="toolbar"><button class="primary" id="backJournal">\u2190 Back to trades</button></div>'+
-      ladderPanelHTML()+weightsPanelHTML()+filterAuditHTML()+learnPanelHTML()+shadowPanelHTML();
+      progressPanelHTML()+ladderPanelHTML()+weightsPanelHTML()+filterAuditHTML()+learnPanelHTML()+shadowPanelHTML();
   }
 
   var openN=S.trades.filter(function(t){return t.status==="open";}).length;
@@ -4303,6 +4785,7 @@ function journalPane(){
   if(S.storageError)
     h+='<div class="banner err"><b>\u26a0\ufe0f Trades are not being saved</b><br><br>'+
       esc(S.storageError)+'</div>';
+  h+=retargetPanelHTML();
   h+=walletPanelHTML();
 
   // ---- paper results: the whole point of the dry run ----
@@ -4476,6 +4959,7 @@ function journalPane(){
 
     h+='<div class="levels"><div class="hd">'+
       (t.paper?"\ud83e\uddea Paper \u00b7 ":"")+(open?"Running":"Resolved")+
+      (t.retargeted?" \u00b7 retargeted":"")+
       (open&&t.paper?" (auto)":"")+'</div>'+
       '<div class="lvl"><span class="lbl">Entry</span><span>'+px(t.entry)+'</span></div>';
     if(open){
@@ -4892,6 +5376,18 @@ function cfgPane(){
   compact(need)+'</b> of liquidity, and anything costing more than <b>'+usd(c.sizeUsd*c.maxFeeDragPct/100)+
   '</b> in total fees gets blocked.</div>'+
 
+  (function(){
+    var ad=socialAdapter();
+    return '<div class="field"><label>X / social adapter</label>'+
+      '<div class="hint" style="margin-top:0">'+
+      (ad
+        ? '<span style="color:var(--frog)">Connected'+(ad.name?" \u2014 "+esc(ad.name):"")+
+          '.</span> X activity appears on cards and is measured against your results.'
+        : 'Not connected. A static page cannot call the X API directly \u2014 it needs a proxy holding '+
+          'the key. Define <span style="font-family:var(--mono)">window.RIBBIT_X</span> to plug one in; '+
+          'the interface is documented in the source above <span style="font-family:var(--mono)">socialAdapter()</span>.')+
+      '</div></div>';
+  })()+
   '<div class="tog"><div><div class="t">Adaptive grading</div><div class="s">Reweight the eight grading factors toward whichever ones actually predicted your results. Activates after '+WEIGHT_MIN_N+' resolved trades and is capped at '+(WEIGHT_MAX_BLEND*100).toFixed(0)+'% learned, so the original weights always keep a say.</div></div>'+sw("swAdapt",c.adaptWeights)+'</div>'+
   '<div class="tog"><div><div class="t">Personalised ranking</div><div class="s">Reorder results using your own resolved trades \u2014 tokens like your winners rise, tokens like your losers fall. Activates after '+FIT_MIN_TRADES+' resolved trades. Never affects safety checks.</div></div>'+sw("swPers",c.personalise)+'</div>'+
   '<div class="tog"><div><div class="t">Strict mode</div><div class="s">Block anything unverifiable, not just what fails outright. Unverifiable usually means brand new or deliberately obscured.</div></div>'+sw("swStrict",c.strict)+'</div>'+
@@ -5076,6 +5572,17 @@ function render(){
   if(wt)wt.onclick=function(){S.watching?stopWatching():startWatching();};
   var nb=document.getElementById("notifBtn");if(nb)nb.onclick=requestNotify;
   var tc=document.getElementById("trCsv");if(tc)tc.onclick=exportTradesCSV;
+  Array.prototype.forEach.call(app.querySelectorAll("[data-retarget]"),function(b){
+    b.onclick=function(){
+      var tp=(b.getAttribute("data-retarget")||"").split(",").map(Number)
+        .filter(function(x){return isFinite(x)&&x>1;});
+      if(!tp.length)return;
+      var n2=retargetOpen(tp);
+      S.cfg.tp=tp; saveCfg();
+      S.journalNote=n2+" running trade"+(n2===1?"":"s")+" retargeted to "+
+        tp.map(function(m){return m+"x";}).join(" / ")+", and new trades will use it too.";
+      render();
+    };});
   var al=document.getElementById("applyLadder");
   if(al)al.onclick=function(){
     var tp=(al.getAttribute("data-tp")||"").split(",").map(Number).filter(function(x){return isFinite(x)&&x>1;});
