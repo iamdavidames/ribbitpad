@@ -1286,6 +1286,7 @@ function runScan(){
       if(finished)return; finished=true;
       S.passed.concat(S.unverified).forEach(function(p){p._attn=attentionFor(p);p._narr=narrativeFor(p);});
       socialEnrich(S.passed.concat(S.unverified));
+      candleEnrich(rankAndFilter(S.passed).slice(0,6));
       shadowRecord(S.passed.concat(S.unverified));
       S.passed.sort(function(a,b){return b._cv.total-a._cv.total;});
       S.loading=false;S.progress="";S.pct=100;S.lastFetch=Date.now();render();
@@ -1330,6 +1331,7 @@ function lookupOne(q){
         p._gate=gate(p,sec,p._econ,{safetyOnly:true});p._cv=conviction(p,sec,p._econ);
         p._attn=attentionFor(p);
         socialFetch(p).then(function(d){if(d){p._social=d;render();}});
+        fetchCandles(p).then(function(a){if(a){p._candles=a;render();}});
         S.lookup=p;S.lookupLoading=false;render();
       });
     }).catch(function(e){
@@ -1388,6 +1390,7 @@ function runHeat(){
     function done(){if(fin)return;fin=true;
       S.heat.concat(S.heatUnverified).forEach(function(p){p._attn=attentionFor(p);p._narr=narrativeFor(p);});
       socialEnrich(S.heat.concat(S.heatUnverified));
+      candleEnrich(rankAndFilter(S.heat).slice(0,6));
       shadowRecord(S.heat.concat(S.heatUnverified));
       S.heat.sort(function(a,b){return b._heat.score-a._heat.score;});
       S.heatLoading=false;render();}
@@ -1614,6 +1617,9 @@ function logTrade(p,entryOverride,sizeOverride,paperMode){
         verdict:(p._gate&&p._gate.verdict)||"?",
         trending:p._attn?(p._attn.confident?"yes":"ticker-only"):"no",
         narrative:p._narr?p._narr.id:null,
+        rsi:(p._candles&&!p._candles.thin)?Math.round(p._candles.rsi):null,
+        rsiBand:(p._candles&&!p._candles.thin)
+          ? (p._candles.rsi>=70?"high":p._candles.rsi<=35?"low":"mid") : null,
         narrativeHot:p._narr?"yes":"no",
         blockers:(p._gate&&Array.isArray(p._gate.blockers))?p._gate.blockers.slice(0,6):[],
         xAccounts:(p._social&&p._social.accounts!=null)?p._social.accounts:null,
@@ -1980,7 +1986,8 @@ function learnBuckets(){
     byVerdict:group(function(f){return f.verdict;},"Safety verdict"),
     byTrending:group(function(f){return f.trending;},"Trending when you bought"),
     byX:group(function(f){return f.xBand;},"X activity when you bought"),
-    byNarrative:group(function(f){return f.narrativeHot;},"Rode a hot narrative")
+    byNarrative:group(function(f){return f.narrativeHot;},"Rode a hot narrative"),
+    byRsi:group(function(f){return f.rsiBand;},"RSI when you bought")
   };
 }
 
@@ -2225,7 +2232,7 @@ function learnPanelHTML(){
   }
 
   // the raw tables, always shown
-  [b.byGrade,b.byProfile,b.byHeat,b.byTrending,b.byNarrative,b.byX,b.byFdv,b.byAge,b.byChain,b.byVerdict].forEach(function(gr){
+  [b.byGrade,b.byProfile,b.byHeat,b.byRsi,b.byTrending,b.byNarrative,b.byX,b.byFdv,b.byAge,b.byChain,b.byVerdict].forEach(function(gr){
     if(!gr.rows.length)return;
     h+='<div class="factors" style="margin:0 18px 12px"><div class="hd"><span>'+esc(gr.label)+
       '</span><span>expectancy</span></div>';
@@ -3295,6 +3302,187 @@ var NARRATIVE_KEYS={
   "animal-racing":["horse","race","racing"],
   "politifi":["trump","biden","maga","election","vote","potus"]
 };
+
+// ===========================================================================
+// CANDLE ANALYSIS  —  real technical indicators from OHLCV data
+//
+// Everything up to here reads summary stats: 24h change, current liquidity.
+// This pulls actual candles, which allows the indicators traders actually use.
+//
+// Three are computed, chosen because each answers a question the summary
+// numbers cannot:
+//   RSI          — is this overbought after its run, or still has room?
+//   Bollinger    — is price stretched away from its own recent average?
+//   Trend/slope  — is the move accelerating, steady, or already rolling over?
+//
+// Deliberately NOT folded into the grade. Technical indicators on a token
+// three hours old are computed from almost no history and mean very little;
+// on an established token they mean more. Rather than guess where that line
+// sits, the readings are shown to you and recorded, and your own results
+// decide whether they were worth anything.
+// ===========================================================================
+var CANDLES={cache:{}, inflight:{}};
+
+function candleKey(p){
+  return (p.chainId||"")+":"+(p.pairAddress||"");
+}
+
+// Fetch for a handful of tokens, then re-render once. Capped deliberately:
+// this is one request per token and the free endpoint is rate-limited.
+function candleEnrich(list){
+  if(!list||!list.length)return;
+  var pending=0,any=false;
+  list.forEach(function(p,i){
+    pending++;
+    setTimeout(function(){
+      fetchCandles(p).then(function(a){
+        if(a){p._candles=a;any=true;}
+        if(--pending<=0&&any)render();
+      });
+    },i*250);
+  });
+}
+
+function fetchCandles(p){
+  var net=null;
+  for(var i=0;i<GT_NETS.length;i++) if(GT_NETS[i][1]===p.chainId){net=GT_NETS[i][0];break;}
+  if(!net||!p.pairAddress)return Promise.resolve(null);
+  var k=candleKey(p);
+  var c=CANDLES.cache[k];
+  if(c&&Date.now()-c.at<300000)return Promise.resolve(c.data);
+  if(CANDLES.inflight[k])return CANDLES.inflight[k];
+
+  CANDLES.inflight[k]=fetchJSON(GT+"/networks/"+net+"/pools/"+encodeURIComponent(p.pairAddress)+
+      "/ohlcv/hour?aggregate=1&limit=100",10000)
+    .then(function(d){
+      var list=(d&&d.data&&d.data.attributes&&d.data.attributes.ohlcv_list)||[];
+      // GeckoTerminal returns newest-first: [ts, open, high, low, close, volume]
+      var rows=list.slice().reverse().map(function(r){
+        return {t:num(r[0]),o:num(r[1]),h:num(r[2]),l:num(r[3]),c:num(r[4]),v:num(r[5])};
+      }).filter(function(r){return r.c>0;});
+      var res=rows.length>=8?analyseCandles(rows):null;
+      CANDLES.cache[k]={at:Date.now(),data:res};
+      delete CANDLES.inflight[k];
+      return res;
+    }).catch(function(){
+      CANDLES.cache[k]={at:Date.now(),data:null};
+      delete CANDLES.inflight[k];
+      return null;
+    });
+  return CANDLES.inflight[k];
+}
+
+function analyseCandles(rows){
+  var closes=rows.map(function(r){return r.c;});
+  var n=closes.length;
+
+  // ---- RSI (Wilder, 14-period or as much history as exists) ----
+  var period=Math.min(14,Math.max(5,Math.floor(n/2)));
+  var gain=0,loss=0;
+  for(var i=1;i<=period;i++){
+    var ch=closes[i]-closes[i-1];
+    if(ch>=0)gain+=ch; else loss-=ch;
+  }
+  var ag=gain/period, al=loss/period;
+  for(var j=period+1;j<n;j++){
+    var d2=closes[j]-closes[j-1];
+    ag=(ag*(period-1)+(d2>0?d2:0))/period;
+    al=(al*(period-1)+(d2<0?-d2:0))/period;
+  }
+  // A flat price has neither gains nor losses. Returning 100 there would read
+  // as "overbought" when nothing has happened at all — so no movement is 50.
+  var rsi;
+  if(ag===0&&al===0) rsi=50;
+  else if(al===0)    rsi=100;
+  else if(ag===0)    rsi=0;
+  else               rsi=100-(100/(1+ag/al));
+
+  // ---- Bollinger position ----
+  var bp=Math.min(20,n);
+  var recent=closes.slice(-bp);
+  var mean=recent.reduce(function(a,x){return a+x;},0)/bp;
+  var variance=recent.reduce(function(a,x){return a+(x-mean)*(x-mean);},0)/bp;
+  var sd=Math.sqrt(variance);
+  var upper=mean+2*sd, lower=mean-2*sd;
+  var last=closes[n-1];
+  var bandPos=(upper>lower)?((last-lower)/(upper-lower)):0.5;
+
+  // ---- short-term slope vs longer slope ----
+  function slope(arr){
+    if(arr.length<3)return 0;
+    var first=arr[0], lastv=arr[arr.length-1];
+    return first>0?((lastv-first)/first)*100:0;
+  }
+  var shortSlope=slope(closes.slice(-6));
+  var longSlope=slope(closes.slice(-Math.min(24,n)));
+
+  // ---- volume trend ----
+  var vols=rows.map(function(r){return r.v;});
+  var vRecent=vols.slice(-6).reduce(function(a,x){return a+x;},0)/Math.min(6,vols.length);
+  var vEarlier=vols.slice(0,-6);
+  var vBase=vEarlier.length?vEarlier.reduce(function(a,x){return a+x;},0)/vEarlier.length:vRecent;
+  var volTrend=vBase>0?((vRecent-vBase)/vBase)*100:0;
+
+  // ---- drawdown from the high in this window ----
+  var high=Math.max.apply(null,rows.map(function(r){return r.h;}));
+  var fromHigh=high>0?((last-high)/high)*100:0;
+
+  return {
+    bars:n, hours:n,
+    rsi:rsi, bandPos:bandPos, mean:mean, upper:upper, lower:lower, last:last,
+    shortSlope:shortSlope, longSlope:longSlope, volTrend:volTrend, fromHigh:fromHigh,
+    thin:n<20     // too little history for these to mean much
+  };
+}
+
+// Plain-language reading of the numbers.
+function candleReadout(a){
+  if(!a)return [];
+  var out=[];
+  if(a.rsi>=78)out.push({s:"wr",t:"RSI "+a.rsi.toFixed(0)+" \u2014 overbought, buyers may be exhausted"});
+  else if(a.rsi<=25)out.push({s:"wr",t:"RSI "+a.rsi.toFixed(0)+" \u2014 heavily sold off"});
+  else out.push({s:"ok",t:"RSI "+a.rsi.toFixed(0)+" \u2014 neither stretched nor collapsed"});
+
+  if(a.bandPos>=0.98)out.push({s:"wr",t:"Price is above its upper Bollinger band \u2014 far from its own average"});
+  else if(a.bandPos<=0.02)out.push({s:"wr",t:"Price is below its lower band"});
+
+  if(a.shortSlope>0&&a.longSlope>0&&a.shortSlope>a.longSlope/2)
+    out.push({s:"ok",t:"Rising over both 6h and 24h, still accelerating"});
+  else if(a.shortSlope<-5&&a.longSlope>10)
+    out.push({s:"wr",t:"Up over 24h but down "+Math.abs(a.shortSlope).toFixed(0)+"% in the last 6h \u2014 rolling over"});
+
+  if(a.volTrend<=-45)out.push({s:"wr",t:"Volume down "+Math.abs(a.volTrend).toFixed(0)+"% versus earlier bars"});
+  else if(a.volTrend>=60)out.push({s:"ok",t:"Volume up "+a.volTrend.toFixed(0)+"% versus earlier bars"});
+
+  if(a.fromHigh<=-40)out.push({s:"wr",t:Math.abs(a.fromHigh).toFixed(0)+"% below its high in this window"});
+  return out;
+}
+
+function candleHTML(p){
+  var a=p._candles;
+  if(!a)return "";
+  var flags=candleReadout(a);
+  var bad=flags.filter(function(f){return f.s==="wr";}).length;
+  var col=bad>=2?"var(--amber)":"var(--blue)";
+  var h='<div style="margin-top:12px;border:1px solid '+col+';border-radius:10px;overflow:hidden">'+
+    '<div style="padding:11px 13px;background:rgba(255,255,255,.03);font-size:12px;text-transform:uppercase;'+
+    'letter-spacing:.08em;font-weight:800;color:'+col+';display:flex;justify-content:space-between">'+
+    '<span>\ud83d\udcca Chart read</span><span style="font-family:var(--mono);font-size:11.5px;opacity:.8">'+
+    a.bars+'h of candles</span></div><div style="padding:12px 13px">';
+  flags.forEach(function(f){
+    var c=f.s==="wr"?"var(--amber)":"var(--frog)";
+    h+='<div class="chk" style="padding-left:0"><span class="ic" style="color:'+c+'">'+
+      (f.s==="wr"?"!":"\u2713")+'</span><span class="tx" style="color:'+c+'">'+esc(f.t)+'</span></div>';
+  });
+  if(a.thin)
+    h+='<div style="margin-top:9px;font-size:13px;color:var(--dim);line-height:1.6">'+
+      'Only '+a.bars+' hourly bars exist. Indicators built on this little history are close to '+
+      'meaningless \u2014 treat this as a rough sketch, not a reading.</div>';
+  else
+    h+='<div style="margin-top:9px;font-size:12.5px;color:var(--dim);line-height:1.6">'+
+      'Recorded and measured against your results, not folded into the grade.</div>';
+  return h+'</div></div>';
+}
 
 function fetchNarratives(force){
   if(NARRATIVE.loading)return Promise.resolve(NARRATIVE);
@@ -4422,6 +4610,7 @@ function cardHTML(p,isBlocked){
     }
   }
   h+=socialHTMLBlock(p);
+  h+=candleHTML(p);
   h+=narrativeHTML(p);
   h+=attentionHTML(p);
   h+=fitHTML(p);
